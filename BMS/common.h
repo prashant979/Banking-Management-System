@@ -66,6 +66,7 @@ typedef struct {
     char message[FEEDBACK_MAX_LEN + 1];
 } Feedback;
 
-
+#define MIN_PASSWORD_LEN  6
+#define MAX_PASSWORD_LEN  20
 
 #endif
