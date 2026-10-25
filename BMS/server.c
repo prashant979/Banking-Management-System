@@ -99,10 +99,17 @@ int main(void) {
         perror("listen"); close(server_fd); exit(EXIT_FAILURE);
     }
     printf("Server listening on port %d...\n", SERVER_PORT);
+    
+    if (customer_validate_file() != 0) {
+        fprintf(stderr, "%s is missing or not in the fixed-width record format "
+                        "(%d bytes per row). Convert it, then restart.\n",
+                CUSTOMER_FILE, RECORD_SIZE);
+        exit(EXIT_FAILURE);
+    }
 
-        if (auth_reset_sessions() != 0) {
-        	fprintf(stderr, "Warning: could not reset sessions in %s\n", CUSTOMER_FILE);
-	}
+    if (auth_reset_sessions() != 0) {
+    	fprintf(stderr, "Warning: could not reset sessions in %s\n", CUSTOMER_FILE);
+    }
     /* accept loop */
     while (1) {
         client_fd = accept(server_fd, (struct sockaddr *)&cli_addr, &cli_len);
