@@ -303,6 +303,49 @@ done:
     return rc;
 }
 
+/* 6-49 printable ASCII characters, no spaces, no commas (a comma would break the CSV row). */
+static int password_policy_ok(const char *pw) {
+    size_t len = strlen(pw);
+    if (len < MIN_PASSWORD_LEN || len > MAX_PASSWORD_LEN) return -1;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)pw[i];
+        if (c <= 32 || c >= 127 || c == ',') return -1;
+    }
+    return 0;
+}
+
+/* Verifies the old password and saves the new one under an EXCLUSIVE lock.
+   The file is replaced atomically, so a failed write leaves the old password in place. */
+PasswordStatus customer_change_password(int user_id, const char *old_pw, const char *new_pw) {
+    if (password_policy_ok(new_pw) != 0) return PW_INVALID_NEW;
+
+    FILE *fp = customer_open_locked(F_WRLCK);
+    if (!fp) return PW_ERROR;
+
+    Customer *list = NULL;
+    int n = customer_read_all(fp, &list);
+    PasswordStatus st = PW_ERROR;
+
+    if (n >= 0) {
+        for (int i = 0; i < n; i++) {
+            if (list[i].id != user_id) continue;
+
+            if (strcmp(list[i].password, old_pw) != 0)
+                st = PW_WRONG_OLD;
+            else if (strcmp(old_pw, new_pw) == 0)
+                st = PW_SAME_AS_OLD;
+            else {
+                strncpy(list[i].password, new_pw, sizeof(list[i].password) - 1);
+                st = (customer_write_all(list, n) == 0) ? PW_OK : PW_ERROR;
+            }
+            break;
+        }
+        free(list);
+    }
+    customer_close_unlock(fp);
+    return st;
+}
+
 /* Shared by deposit and withdraw: log record + balance update, all or nothing.
    On success *new_balance is the balance after the transaction.
    On TXN_INSUFFICIENT_FUNDS *new_balance is the current (unchanged) balance. */
@@ -648,6 +691,40 @@ static void do_feedback(int fd, const Session *session) {
         send_message(fd, "Could not save your feedback. Please try again.\n");
 }
 
+static void do_change_password(int fd, const Session *session) {
+    char old_pw[BUFFER_SIZE], new1[BUFFER_SIZE], new2[BUFFER_SIZE], msg[BUFFER_SIZE];
+
+    if (prompt_input(fd, "Enter current password: ", old_pw, sizeof(old_pw)) <= 0) return;
+    if (prompt_input(fd, "Enter new password: ", new1, sizeof(new1)) <= 0) return;
+    if (prompt_input(fd, "Confirm new password: ", new2, sizeof(new2)) <= 0) return;
+
+    if (strcmp(new1, new2) != 0) {
+        send_message(fd, "Passwords do not match. Password not changed.\n");
+        return;
+    }
+
+    switch (customer_change_password(session->user_id, old_pw, new1)) {
+    case PW_OK:
+        send_message(fd, "Password changed successfully.\n");
+        break;
+    case PW_WRONG_OLD:
+        send_message(fd, "Current password is incorrect. Password not changed.\n");
+        break;
+    case PW_INVALID_NEW:
+        snprintf(msg, sizeof(msg),
+                 "New password must be %d-%d characters with no spaces or commas.\n",
+                 MIN_PASSWORD_LEN, MAX_PASSWORD_LEN);
+        send_message(fd, msg);
+        break;
+    case PW_SAME_AS_OLD:
+        send_message(fd, "New password must be different from the current one.\n");
+        break;
+    default:
+        send_message(fd, "Could not change the password due to a server error. "
+                         "Your password was not changed.\n");
+    }
+}
+
 void customer_menu(int fd, Session *session) {
     char buf[BUFFER_SIZE], msg[BUFFER_SIZE];
 
@@ -696,10 +773,13 @@ void customer_menu(int fd, Session *session) {
         case 7:
             do_feedback(fd, session);
             break;
+        case 8:
+            do_change_password(fd, session);
+            break;
         case 9:
             send_message(fd, "Logged out.\n");
             return;
-        case 5: case 8:
+        case 5:
             send_message(fd, "This feature will be implemented in the next step.\n");
             break;
         default:

@@ -30,4 +30,14 @@ int customer_add_feedback(int user_id, const char *message);   /* 0 ok, -1 error
 
 void  customer_menu(int fd, Session *session);
 
+typedef enum {
+    PW_OK = 0,
+    PW_WRONG_OLD,
+    PW_INVALID_NEW,
+    PW_SAME_AS_OLD,
+    PW_ERROR
+} PasswordStatus;
+
+PasswordStatus customer_change_password(int user_id, const char *old_pw, const char *new_pw);
+
 #endif
