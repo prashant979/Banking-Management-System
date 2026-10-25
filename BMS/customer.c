@@ -453,35 +453,39 @@ static int password_policy_ok(const char *pw) {
     return 0;
 }
 
-/* Verifies the old password and saves the new one under an EXCLUSIVE lock.
-   The file is replaced atomically, so a failed write leaves the old password in place. */
+/* Verifies the old password and saves the new one under an EXCLUSIVE lock on this
+   customer's record only. A failed write restores the previous row. */
 PasswordStatus customer_change_password(int user_id, const char *old_pw, const char *new_pw) {
     if (password_policy_ok(new_pw) != 0) return PW_INVALID_NEW;
 
-    FILE *fp = customer_open_locked(F_WRLCK);
-    if (!fp) return PW_ERROR;
+    int fd = customer_open();
+    if (fd < 0) return PW_ERROR;
 
-    Customer *list = NULL;
-    int n = customer_read_all(fp, &list);
+    int idx = customer_find_by_id(fd, user_id);           /* lock-free locate */
+    if (idx < 0) { close(fd); return PW_ERROR; }
+
     PasswordStatus st = PW_ERROR;
-
-    if (n >= 0) {
-        for (int i = 0; i < n; i++) {
-            if (list[i].id != user_id) continue;
-
-            if (strcmp(list[i].password, old_pw) != 0)
+    if (customer_lock(fd, idx, F_WRLCK) == 0) {
+        Customer c;
+        if (customer_read_record(fd, idx, &c) == 0 && c.id == user_id) {   /* re-check under lock */
+            if (strcmp(c.password, old_pw) != 0) {
                 st = PW_WRONG_OLD;
-            else if (strcmp(old_pw, new_pw) == 0)
+            } else if (strcmp(old_pw, new_pw) == 0) {
                 st = PW_SAME_AS_OLD;
-            else {
-                strncpy(list[i].password, new_pw, sizeof(list[i].password) - 1);
-                st = (customer_write_all(list, n) == 0) ? PW_OK : PW_ERROR;
+            } else {
+                Customer before = c;                      /* before-image for undo */
+                strncpy(c.password, new_pw, sizeof(c.password) - 1);
+                if (customer_write_record(fd, idx, &c) == 0) {
+                    st = PW_OK;
+                } else {
+                    customer_write_record(fd, idx, &before);   /* fallback: old password stays */
+                    st = PW_ERROR;
+                }
             }
-            break;
         }
-        free(list);
+        customer_unlock(fd, idx);
     }
-    customer_close_unlock(fp);
+    close(fd);                                            /* close only after unlocking */
     return st;
 }
 
