@@ -336,6 +336,27 @@ static int parse_account_id(const char *s, int *out) {
     return 0;
 }
 
+/* Reads the latest balance under a SHARED lock on this customer's record only. */
+int customer_get_balance(int user_id, double *balance) {
+    int fd = customer_open();
+    if (fd < 0) return -1;
+
+    int idx = customer_find_by_id(fd, user_id);        /* lock-free locate */
+    if (idx < 0) { close(fd); return -1; }
+
+    int rc = -1;
+    if (customer_lock(fd, idx, F_RDLCK) == 0) {        /* shared: readers don't block readers */
+        Customer c;
+        if (customer_read_record(fd, idx, &c) == 0 && c.id == user_id) {   /* re-check under lock */
+            *balance = c.balance;
+            rc = 0;
+        }
+        customer_unlock(fd, idx);
+    }
+    close(fd);                                         /* close only after unlocking */
+    return rc;
+}
+
 /* Returns this customer's transactions, oldest first, read under a SHARED lock.
    Returns the count (possibly 0), or -1 on error. The caller must free(*out). */
 int customer_get_history(int user_id, Transaction **out) {
