@@ -485,42 +485,44 @@ PasswordStatus customer_change_password(int user_id, const char *old_pw, const c
     return st;
 }
 
-/* Shared by deposit and withdraw: log record + balance update, all or nothing.
+/* Shared by deposit and withdraw. Locks ONLY this customer's record.
    On success *new_balance is the balance after the transaction.
    On TXN_INSUFFICIENT_FUNDS *new_balance is the current (unchanged) balance. */
 static TxnStatus apply_transaction(int user_id, double amount,
                                    const char *type, int is_debit,
                                    double *new_balance) {
     TxnStatus status = TXN_IO_ERROR;
-    Customer *list = NULL;
     FILE *txn = NULL;
     long txn_size = 0;
-    int n, idx = -1;
+    int idx, locked = 0;
     double updated;
+    Customer c, before;
     Transaction t;
 
-    FILE *fp = customer_open_locked(F_WRLCK);           /* serialises every balance change */
-    if (!fp) return TXN_IO_ERROR;
+    int fd = customer_open();
+    if (fd < 0) return TXN_IO_ERROR;
 
-    n = customer_read_all(fp, &list);
-    if (n < 0) goto done;
+    idx = customer_find_by_id(fd, user_id);               /* lock-free locate */
+    if (idx == -2) goto done;
+    if (idx < 0)   { status = TXN_NOT_FOUND; goto done; }
 
-    for (int i = 0; i < n; i++)
-        if (list[i].id == user_id) { idx = i; break; }
-    if (idx < 0)           { status = TXN_NOT_FOUND; goto done; }
-    if (!list[idx].active) { status = TXN_INACTIVE;  goto done; }
+    if (customer_lock(fd, idx, F_WRLCK) < 0) goto done;   /* exclusive lock on ONE record */
+    locked = 1;
 
-    /* Check and debit under the SAME lock: no other process can spend this money in between */
-    if (is_debit && to_cents(list[idx].balance) < to_cents(amount)) {
-        *new_balance = list[idx].balance;
+    /* Everything below uses the copy read AFTER locking */
+    if (customer_read_record(fd, idx, &c) != 0 || c.id != user_id) goto done;
+    if (!c.active) { status = TXN_INACTIVE; goto done; }
+
+    if (is_debit && to_cents(c.balance) < to_cents(amount)) {
+        *new_balance = c.balance;
         status = TXN_INSUFFICIENT_FUNDS;
         goto done;
     }
 
-    updated = round2(is_debit ? list[idx].balance - amount
-                              : list[idx].balance + amount);
+    before  = c;                                          /* before-image for undo */
+    updated = round2(is_debit ? c.balance - amount : c.balance + amount);
 
-    txn = txn_open_locked(&txn_size);                   /* lock order: customer, then txn */
+    txn = txn_open_locked(&txn_size);                     /* lock order: customer record, then log */
     if (!txn) goto done;
 
     memset(&t, 0, sizeof(t));
@@ -529,14 +531,15 @@ static TxnStatus apply_transaction(int user_id, double amount,
     t.balance_after = updated;
     strncpy(t.type, type, sizeof(t.type) - 1);
 
-    if (txn_append(txn, &t) != 0) {                     /* step 1: write the log */
+    if (txn_append(txn, &t) != 0) {                       /* step 1: write the log row */
         txn_rollback(txn, txn_size);
         goto done;
     }
 
-    list[idx].balance = updated;
-    if (customer_write_all(list, n) != 0) {             /* step 2: commit the balance */
-        txn_rollback(txn, txn_size);                    /* fallback: remove the log record */
+    c.balance = updated;
+    if (customer_write_record(fd, idx, &c) != 0) {        /* step 2: commit the new balance */
+        customer_write_record(fd, idx, &before);          /* fallback: restore the old row ... */
+        txn_rollback(txn, txn_size);                      /* ... and remove the log row */
         goto done;
     }
 
@@ -544,9 +547,9 @@ static TxnStatus apply_transaction(int user_id, double amount,
     status = TXN_OK;
 
 done:
-    if (txn) txn_close_unlock(txn);
-    free(list);
-    customer_close_unlock(fp);
+    if (txn) txn_close_unlock(txn);                       /* release in reverse order */
+    if (locked) customer_unlock(fd, idx);
+    close(fd);                                            /* close only after unlocking */
     return status;
 }
 
