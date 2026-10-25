@@ -53,4 +53,20 @@ void customer_menu(int fd, Session *session);
 int customer_validate_logs(void); 
     /* startup check for transaction.csv and feedback.csv */
 
+typedef enum {
+    ADD_OK = 0,
+    ADD_BAD_FIRSTNAME,
+    ADD_BAD_LASTNAME,
+    ADD_BAD_USERNAME,
+    ADD_BAD_PASSWORD,
+    ADD_BAD_BALANCE,
+    ADD_USERNAME_TAKEN,
+    ADD_IO_ERROR
+} AddStatus;
+
+AddStatus customer_add(const char *firstname, const char *lastname, const char *username,
+                       const char *password, const char *balance_str, int *new_id);
+
+
+
 #endif

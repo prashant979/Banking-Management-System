@@ -328,8 +328,8 @@ static long long to_cents(double x) {
     return (long long)(x * 100.0 + 0.5);
 }
 
-/* Accepts only digits and at most one '.', > 0, <= MAX_TXN_AMOUNT, max 2 decimals. */
-static int parse_amount(const char *s, double *out) {
+/* Digits and at most one '.', max 2 decimals, 0 (only if allow_zero) up to MAX_TXN_AMOUNT. */
+static int parse_money(const char *s, int allow_zero, double *out) {
     int digits = 0, dots = 0;
     for (const char *p = s; *p; p++) {
         if (isdigit((unsigned char)*p)) digits++;
@@ -339,7 +339,8 @@ static int parse_amount(const char *s, double *out) {
     if (digits == 0 || dots > 1) return -1;
 
     double v = strtod(s, NULL);
-    if (v <= 0.0 || v > MAX_TXN_AMOUNT) return -1;
+    if (v > MAX_TXN_AMOUNT) return -1;
+    if (v == 0.0 && !allow_zero) return -1;
 
     long long cents = (long long)(v * 100.0 + 0.5);
     double diff = v * 100.0 - (double)cents;
@@ -348,6 +349,10 @@ static int parse_amount(const char *s, double *out) {
 
     *out = (double)cents / 100.0;
     return 0;
+}
+
+static int parse_amount(const char *s, double *out) {
+    return parse_money(s, 0, out);
 }
 
 /* Digits only, 1-9 characters, value > 0. */
@@ -514,6 +519,87 @@ PasswordStatus customer_change_password(int user_id, const char *old_pw, const c
     }
     close(fd);                                            /* close only after unlocking */
     return st;
+}
+
+static int valid_name(const char *s) {                  /* letters only, 1-20 */
+    size_t len = strlen(s);
+    if (len < 1 || len > CUSTOMER_FIELD_LEN) return 0;
+    for (size_t i = 0; i < len; i++)
+        if (!isalpha((unsigned char)s[i])) return 0;
+    return 1;
+}
+
+static int valid_username(const char *s) {              /* lowercase letters, digits, '_', 3-20 */
+    size_t len = strlen(s);
+    if (len < 3 || len > CUSTOMER_FIELD_LEN) return 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (!islower(c) && !isdigit(c) && c != '_') return 0;
+    }
+    return 1;
+}
+
+AddStatus customer_add(const char *firstname, const char *lastname, const char *username,
+                       const char *password, const char *balance_str, int *new_id) {
+    AddStatus status = ADD_IO_ERROR;
+    int guard = 0, row_locked = 0, n, i;
+    off_t off = 0;
+    double balance;
+    Customer c, other;
+    char row[RECORD_SIZE + 1];
+
+    if (!valid_name(firstname))               return ADD_BAD_FIRSTNAME;
+    if (!valid_name(lastname))                return ADD_BAD_LASTNAME;
+    if (!valid_username(username))            return ADD_BAD_USERNAME;
+    if (password_policy_ok(password) != 0)    return ADD_BAD_PASSWORD;
+    if (parse_money(balance_str, 1, &balance) != 0) return ADD_BAD_BALANCE;
+
+    int fd = customer_open();
+    if (fd < 0) return ADD_IO_ERROR;
+
+    if (lock_record(fd, F_WRLCK, 0, 1) < 0) goto done;     /* guard: one add at a time */
+    guard = 1;
+
+    n = customer_count(fd);                                /* rows are stable while we hold the guard */
+    if (n < 0) goto done;
+
+    for (i = 0; i < n; i++) {                              /* username must be unused */
+        int taken = 0;
+        if (customer_lock(fd, i, F_RDLCK) < 0) goto done;
+        if (customer_read_record(fd, i, &other) == 0 && strcmp(other.username, username) == 0)
+            taken = 1;
+        customer_unlock(fd, i);
+        if (taken) { status = ADD_USERNAME_TAKEN; goto done; }
+    }
+
+    memset(&c, 0, sizeof(c));
+    c.id        = CUSTOMER_ID_BASE + n + 1;                /* row number n + 1 */
+    c.balance   = balance;
+    c.active    = 1;
+    c.logged_in = 0;
+    strncpy(c.firstname, firstname, sizeof(c.firstname) - 1);
+    strncpy(c.lastname,  lastname,  sizeof(c.lastname)  - 1);
+    strncpy(c.username,  username,  sizeof(c.username)  - 1);
+    strncpy(c.password,  password,  sizeof(c.password)  - 1);
+    if (record_format(&c, row) != 0) goto done;
+
+    off = record_offset(n);                                /* = current end of file */
+    if (lock_record(fd, F_WRLCK, off, RECORD_SIZE) < 0) goto done;
+    row_locked = 1;
+
+    if (pwrite(fd, row, RECORD_SIZE, off) != RECORD_SIZE || fsync(fd) != 0) {
+        if (ftruncate(fd, off) == 0) fsync(fd);            /* fallback: cut the new row off again */
+        goto done;
+    }
+
+    *new_id = c.id;
+    status = ADD_OK;
+
+done:
+    if (row_locked) unlock_record(fd, off, RECORD_SIZE);
+    if (guard)      unlock_record(fd, 0, 1);
+    close(fd);
+    return status;
 }
 
 static TxnStatus apply_transaction(int user_id, double amount,
