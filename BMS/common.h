@@ -102,6 +102,6 @@ typedef Staff Employee;
 typedef Staff Manager;
 typedef Staff Admin;
 
-
+#define CUSTOMER_ID_BASE  1000      /* customer id = 1000 + row number in customer.csv */
 
 #endif
