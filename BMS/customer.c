@@ -245,51 +245,77 @@ done:
     return rc;
 }
 
-/* =====================  transaction.csv helpers  ===================== */
+/* =====================  transaction.csv: append-only fixed-width log  ===================== */
+/* Row: txn_id(10),cust(6),peer(6),type(12),amount(14),balance_after(14),timestamp(12),status(1)\n */
 
-static void txn_close_unlock(FILE *fp) {
-    fflush(fp);
-    unlock_file(fileno(fp));
-    fclose(fp);
+#define TXN_ROW_FMT "%-10d,%-6d,%-6d,%-12s,%14.2f,%14.2f,%-12ld,%c\n"
+
+static int txn_open(void) {
+    return open(TXN_FILE, O_RDWR);
 }
 
-/* Opens transaction.csv with an exclusive lock, writes the header if the file is new,
-   and reports the current size so a failed transaction can be rolled back. */
-static FILE *txn_open_locked(long *size_before) {
-    int fd = open(TXN_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
-    if (fd < 0) return NULL;
-    if (lock_file(fd, F_WRLCK) < 0) { close(fd); return NULL; }
-
-    FILE *fp = fdopen(fd, "a+");
-    if (!fp) { unlock_file(fd); close(fd); return NULL; }
-
-    fseek(fp, 0, SEEK_END);
-    if (ftell(fp) == 0) {                               /* brand-new file */
-        fprintf(fp, "%s\n", TXN_HEADER);
-        if (fflush(fp) != 0) { txn_close_unlock(fp); return NULL; }
-    }
-    fseek(fp, 0, SEEK_END);
-    *size_before = ftell(fp);
-    return fp;
+static int txn_format(const Transaction *t, char *out) {
+    if (strlen(t->type) > 12 || strchr(t->type, ',') != NULL) return -1;
+    int n = snprintf(out, TXN_RECORD_SIZE + 1, TXN_ROW_FMT,
+                     t->id, t->customer_id, t->peer_id, t->type,
+                     t->amount, t->balance_after, t->timestamp, t->status);
+    return (n == TXN_RECORD_SIZE) ? 0 : -1;
 }
 
-static int txn_append(FILE *fp, Transaction *t) {
-    t->id = get_next_id_csv(fp);
-    t->timestamp = (long)time(NULL);
+static int txn_parse(const char *row, Transaction *t) {
+    char buf[TXN_RECORD_SIZE + 1], status = 0;
+    memcpy(buf, row, TXN_RECORD_SIZE);
+    buf[TXN_RECORD_SIZE] = '\0';
+    if (buf[TXN_RECORD_SIZE - 1] != '\n') return -1;
 
-    fseek(fp, 0, SEEK_END);
-    if (fprintf(fp, "%d,%d,%s,%.2f,%.2f,%ld\n",
-                t->id, t->customer_id, t->type,
-                t->amount, t->balance_after, t->timestamp) < 0) return -1;
-    if (fflush(fp) != 0) return -1;
-    if (fsync(fileno(fp)) != 0) return -1;
+    memset(t, 0, sizeof(*t));
+    int n = sscanf(buf, "%d ,%d ,%d ,%12[^,],%lf,%lf,%ld ,%c",
+                   &t->id, &t->customer_id, &t->peer_id, t->type,
+                   &t->amount, &t->balance_after, &t->timestamp, &status);
+    if (n != 8) return -1;
+    if (status != TXN_STATUS_PENDING && status != TXN_STATUS_COMMITTED && status != TXN_STATUS_VOID)
+        return -1;
+
+    t->status = status;
+    trim_right(t->type);
     return 0;
 }
 
-/* Undo an append: cut the file back to its size before the transaction. */
-static void txn_rollback(FILE *fp, long size_before) {
-    fflush(fp);
-    if (ftruncate(fileno(fp), size_before) == 0) fsync(fileno(fp));
+/* Write-ahead: reserve a row, write it as PENDING, fsync. Returns the row number or -1.
+   The row lock is held only while the row is written. */
+static long txn_begin(int lfd, int customer_id, int peer_id, const char *type,
+                      double amount, double balance_after) {
+    Transaction t;
+    char row[TXN_RECORD_SIZE + 1];
+
+    long n = log_reserve(lfd, TXN_RECORD_SIZE);
+    if (n < 0) return -1;
+
+    memset(&t, 0, sizeof(t));
+    t.id            = (int)n;
+    t.customer_id   = customer_id;
+    t.peer_id       = peer_id;
+    t.amount        = amount;
+    t.balance_after = balance_after;
+    t.timestamp     = (long)time(NULL);
+    t.status        = TXN_STATUS_PENDING;
+    strncpy(t.type, type, sizeof(t.type) - 1);
+
+    int ok = (txn_format(&t, row) == 0) &&
+             (log_write_row(lfd, n, TXN_RECORD_SIZE, row) == 0);
+    log_release_row(lfd, n, TXN_RECORD_SIZE);
+    return ok ? n : -1;                 /* on failure a blank row stays behind; readers skip it */
+}
+
+/* Change one row's status byte (PENDING -> COMMITTED or VOID) under that row's lock only. */
+static int txn_finish(int lfd, long row_no, char status) {
+    off_t off = (off_t)row_no * TXN_RECORD_SIZE;
+    int rc = -1;
+
+    if (lock_record(lfd, F_WRLCK, off, TXN_RECORD_SIZE) < 0) return -1;
+    if (pwrite(lfd, &status, 1, off + TXN_RECORD_SIZE - 2) == 1 && fsync(lfd) == 0) rc = 0;
+    unlock_record(lfd, off, TXN_RECORD_SIZE);
+    return rc;
 }
 
 /* =====================  operations  ===================== */
@@ -357,89 +383,90 @@ int customer_get_balance(int user_id, double *balance) {
     return rc;
 }
 
-/* Returns this customer's transactions, oldest first, read under a SHARED lock.
-   Returns the count (possibly 0), or -1 on error. The caller must free(*out). */
+/* Returns this customer's COMMITTED transactions, oldest first. Each row is read under a
+   SHARED lock on that row only, so a reader waits only if a writer is on that very row. */
 int customer_get_history(int user_id, Transaction **out) {
-    int fd = open(TXN_FILE, O_RDONLY | O_CREAT, 0644);   /* create if no transaction happened yet */
+    int fd = txn_open();
     if (fd < 0) return -1;
-    if (lock_file(fd, F_RDLCK) < 0) { close(fd); return -1; }
 
-    FILE *fp = fdopen(fd, "r");
-    if (!fp) { unlock_file(fd); close(fd); return -1; }
+    long rows = log_row_count(fd, TXN_RECORD_SIZE);
+    if (rows < 0) { close(fd); return -1; }
 
     int cap = 16, n = 0;
     Transaction *arr = malloc(cap * sizeof(Transaction));
-    if (!arr) { unlock_file(fd); fclose(fp); return -1; }
+    if (!arr) { close(fd); return -1; }
 
-    char line[512];
-    while (fgets(line, sizeof(line), fp)) {
+    for (long r = 1; r <= rows; r++) {
+        off_t off = (off_t)r * TXN_RECORD_SIZE;
+        char row[TXN_RECORD_SIZE];
         Transaction t;
-        memset(&t, 0, sizeof(t));
-        if (sscanf(line, "%d,%d,%15[^,],%lf,%lf,%ld",
-                   &t.id, &t.customer_id, t.type,
-                   &t.amount, &t.balance_after, &t.timestamp) != 6)
-            continue;                                    /* header or bad line */
-        if (t.customer_id != user_id) continue;
+
+        if (lock_record(fd, F_RDLCK, off, TXN_RECORD_SIZE) < 0) continue;
+        ssize_t got = pread(fd, row, TXN_RECORD_SIZE, off);
+        unlock_record(fd, off, TXN_RECORD_SIZE);
+
+        if (got != TXN_RECORD_SIZE || txn_parse(row, &t) != 0) continue;   /* blank or damaged row */
+        if (t.customer_id != user_id || t.status != TXN_STATUS_COMMITTED) continue;
 
         if (n == cap) {
             cap *= 2;
             Transaction *tmp = realloc(arr, cap * sizeof(Transaction));
-            if (!tmp) { free(arr); unlock_file(fd); fclose(fp); return -1; }
+            if (!tmp) { free(arr); close(fd); return -1; }
             arr = tmp;
         }
         arr[n++] = t;
     }
 
-    unlock_file(fd);
-    fclose(fp);
+    close(fd);
     *out = arr;
     return n;
 }
 
-/* Appends one feedback row under an EXCLUSIVE lock, so picking the next ID and writing
-   the row cannot interleave with another client. Returns 0 on success, -1 on failure
-   (in which case the file is restored to its previous size). */
+/* Feedback row: id(8),cust(6),timestamp(12),message(200)\n  (commas are fine in the message:
+   it is the last column). A failed write leaves a blank row that readers skip. */
+static int feedback_format(const Feedback *f, char *out) {
+    if (strlen(f->message) > FEEDBACK_MAX_LEN || strchr(f->message, '\n') != NULL) return -1;
+    int n = snprintf(out, FEEDBACK_RECORD_SIZE + 1, "%-8d,%-6d,%-12ld,%-200s\n",
+                     f->id, f->customer_id, f->timestamp, f->message);
+    return (n == FEEDBACK_RECORD_SIZE) ? 0 : -1;
+}
+
 int customer_add_feedback(int user_id, const char *message) {
-    int rc = -1;
-    long size_before;
     Feedback f;
+    char row[FEEDBACK_RECORD_SIZE + 1];
+    int rc = -1;
 
-    int fd = open(FEEDBACK_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
+    int fd = open(FEEDBACK_FILE, O_RDWR);
     if (fd < 0) return -1;
-    if (lock_file(fd, F_WRLCK) < 0) { close(fd); return -1; }
 
-    FILE *fp = fdopen(fd, "a+");
-    if (!fp) { unlock_file(fd); close(fd); return -1; }
-
-    fseek(fp, 0, SEEK_END);
-    if (ftell(fp) == 0) {                                /* brand-new file: write header */
-        fprintf(fp, "%s\n", FEEDBACK_HEADER);
-        if (fflush(fp) != 0) goto done;
-    }
-    fseek(fp, 0, SEEK_END);
-    size_before = ftell(fp);
+    long n = log_reserve(fd, FEEDBACK_RECORD_SIZE);       /* guard lock only while reserving */
+    if (n < 0) { close(fd); return -1; }
 
     memset(&f, 0, sizeof(f));
-    f.id          = get_next_id_csv(fp);
+    f.id          = (int)n;
     f.customer_id = user_id;
     f.timestamp   = (long)time(NULL);
     strncpy(f.message, message, sizeof(f.message) - 1);
 
-    fseek(fp, 0, SEEK_END);
-    if (fprintf(fp, "%d,%d,%ld,%s\n", f.id, f.customer_id, f.timestamp, f.message) < 0 ||
-        fflush(fp) != 0 ||
-        fsync(fileno(fp)) != 0) {
-        fflush(fp);
-        if (ftruncate(fileno(fp), size_before) == 0) fsync(fileno(fp));   /* fallback */
-        goto done;
-    }
-    rc = 0;
+    if (feedback_format(&f, row) == 0 &&
+        log_write_row(fd, n, FEEDBACK_RECORD_SIZE, row) == 0)
+        rc = 0;
 
-done:
-    fflush(fp);
-    unlock_file(fileno(fp));
-    fclose(fp);
+    log_release_row(fd, n, FEEDBACK_RECORD_SIZE);
+    close(fd);
     return rc;
+}
+
+/* Startup: create transaction.csv and feedback.csv with headers if missing, else verify the format. */
+int customer_validate_logs(void) {
+    char hdr[FEEDBACK_RECORD_SIZE + 1];
+
+    snprintf(hdr, sizeof(hdr), "%-10s,%-6s,%-6s,%-12s,%14s,%14s,%-12s,%s\n",
+             "txn_id", "cust", "peer", "type", "amount", "balance_after", "timestamp", "s");
+    if (log_validate_file(TXN_FILE, TXN_RECORD_SIZE, hdr) != 0) return -1;
+
+    snprintf(hdr, sizeof(hdr), "%-8s,%-6s,%-12s,%-200s\n", "id", "cust", "timestamp", "message");
+    return log_validate_file(FEEDBACK_FILE, FEEDBACK_RECORD_SIZE, hdr);
 }
 
 /* 6-49 printable ASCII characters, no spaces, no commas (a comma would break the CSV row). */
@@ -489,19 +516,14 @@ PasswordStatus customer_change_password(int user_id, const char *old_pw, const c
     return st;
 }
 
-/* Shared by deposit and withdraw. Locks ONLY this customer's record.
-   On success *new_balance is the balance after the transaction.
-   On TXN_INSUFFICIENT_FUNDS *new_balance is the current (unchanged) balance. */
 static TxnStatus apply_transaction(int user_id, double amount,
                                    const char *type, int is_debit,
                                    double *new_balance) {
     TxnStatus status = TXN_IO_ERROR;
-    FILE *txn = NULL;
-    long txn_size = 0;
-    int idx, locked = 0;
+    int idx, locked = 0, lfd = -1;
+    long row_no;
     double updated;
     Customer c, before;
-    Transaction t;
 
     int fd = customer_open();
     if (fd < 0) return TXN_IO_ERROR;
@@ -513,7 +535,6 @@ static TxnStatus apply_transaction(int user_id, double amount,
     if (customer_lock(fd, idx, F_WRLCK) < 0) goto done;   /* exclusive lock on ONE record */
     locked = 1;
 
-    /* Everything below uses the copy read AFTER locking */
     if (customer_read_record(fd, idx, &c) != 0 || c.id != user_id) goto done;
     if (!c.active) { status = TXN_INACTIVE; goto done; }
 
@@ -526,24 +547,22 @@ static TxnStatus apply_transaction(int user_id, double amount,
     before  = c;                                          /* before-image for undo */
     updated = round2(is_debit ? c.balance - amount : c.balance + amount);
 
-    txn = txn_open_locked(&txn_size);                     /* lock order: customer record, then log */
-    if (!txn) goto done;
+    lfd = txn_open();
+    if (lfd < 0) goto done;
 
-    memset(&t, 0, sizeof(t));
-    t.customer_id   = user_id;
-    t.amount        = amount;
-    t.balance_after = updated;
-    strncpy(t.type, type, sizeof(t.type) - 1);
+    row_no = txn_begin(lfd, user_id, 0, type, amount, updated);   /* 1. durable PENDING row */
+    if (row_no < 0) goto done;
 
-    if (txn_append(txn, &t) != 0) {                       /* step 1: write the log row */
-        txn_rollback(txn, txn_size);
+    c.balance = updated;
+    if (customer_write_record(fd, idx, &c) != 0) {        /* 2. change the balance */
+        customer_write_record(fd, idx, &before);
+        txn_finish(lfd, row_no, TXN_STATUS_VOID);
         goto done;
     }
 
-    c.balance = updated;
-    if (customer_write_record(fd, idx, &c) != 0) {        /* step 2: commit the new balance */
-        customer_write_record(fd, idx, &before);          /* fallback: restore the old row ... */
-        txn_rollback(txn, txn_size);                      /* ... and remove the log row */
+    if (txn_finish(lfd, row_no, TXN_STATUS_COMMITTED) != 0) {   /* 3. commit */
+        customer_write_record(fd, idx, &before);
+        txn_finish(lfd, row_no, TXN_STATUS_VOID);
         goto done;
     }
 
@@ -551,7 +570,7 @@ static TxnStatus apply_transaction(int user_id, double amount,
     status = TXN_OK;
 
 done:
-    if (txn) txn_close_unlock(txn);                       /* release in reverse order */
+    if (lfd >= 0) close(lfd);
     if (locked) customer_unlock(fd, idx);
     close(fd);                                            /* close only after unlocking */
     return status;
@@ -565,18 +584,12 @@ TxnStatus customer_withdraw(int user_id, double amount, double *new_balance) {
     return apply_transaction(user_id, amount, TXN_TYPE_WITHDRAW, 1, new_balance);
 }
 
-/* Debit sender, credit recipient, two log rows. Locks exactly TWO records, always the
-   lower position first, so two opposite transfers (A->B and B->A) can never deadlock.
-   On success *new_balance is the SENDER's balance afterwards.
-   On TXN_INSUFFICIENT_FUNDS *new_balance is the sender's current balance. */
 TxnStatus customer_transfer(int from_id, int to_id, double amount, double *new_balance) {
     TxnStatus status = TXN_IO_ERROR;
-    FILE *txn = NULL;
-    long txn_size = 0;
-    int from, to, lo, hi, lo_locked = 0, hi_locked = 0;
+    int from, to, lo, hi, lo_locked = 0, hi_locked = 0, lfd = -1;
+    long row_out = -1, row_in = -1;
     double src_after, dst_after;
     Customer src, dst, src_before, dst_before;
-    Transaction t;
 
     if (from_id == to_id) return TXN_SAME_ACCOUNT;
 
@@ -589,7 +602,7 @@ TxnStatus customer_transfer(int from_id, int to_id, double amount, double *new_b
     if (from < 0) { status = TXN_NOT_FOUND;         goto done; }
     if (to   < 0) { status = TXN_RECIPIENT_INVALID; goto done; }
 
-    /* Global lock order: lower record position first, whichever direction the money flows */
+    /* Global lock order: lower record position first */
     lo = (from < to) ? from : to;
     hi = (from < to) ? to : from;
 
@@ -598,7 +611,6 @@ TxnStatus customer_transfer(int from_id, int to_id, double amount, double *new_b
     if (customer_lock(fd, hi, F_WRLCK) < 0) goto done;
     hi_locked = 1;
 
-    /* Everything below uses copies read AFTER both locks are held */
     if (customer_read_record(fd, from, &src) != 0 || src.id != from_id) goto done;
     if (customer_read_record(fd, to,   &dst) != 0 || dst.id != to_id)   goto done;
 
@@ -611,35 +623,39 @@ TxnStatus customer_transfer(int from_id, int to_id, double amount, double *new_b
         goto done;
     }
 
-    src_before = src;                                     /* before-images for undo */
+    src_before = src;
     dst_before = dst;
     src_after  = round2(src.balance - amount);
     dst_after  = round2(dst.balance + amount);
 
-    txn = txn_open_locked(&txn_size);                     /* lock order: records, then the log */
-    if (!txn) goto done;
+    lfd = txn_open();
+    if (lfd < 0) goto done;
 
-    memset(&t, 0, sizeof(t));                             /* log row 1: sender */
-    t.customer_id   = from_id;
-    t.amount        = amount;
-    t.balance_after = src_after;
-    strncpy(t.type, TXN_TYPE_TRANSFER_OUT, sizeof(t.type) - 1);
-    if (txn_append(txn, &t) != 0) { txn_rollback(txn, txn_size); goto done; }
+    /* 1. both PENDING rows are durable BEFORE any balance changes */
+    row_out = txn_begin(lfd, from_id, to_id, TXN_TYPE_TRANSFER_OUT, amount, src_after);
+    if (row_out < 0) goto done;
+    row_in = txn_begin(lfd, to_id, from_id, TXN_TYPE_TRANSFER_IN, amount, dst_after);
+    if (row_in < 0) { txn_finish(lfd, row_out, TXN_STATUS_VOID); goto done; }
 
-    memset(&t, 0, sizeof(t));                             /* log row 2: recipient */
-    t.customer_id   = to_id;
-    t.amount        = amount;
-    t.balance_after = dst_after;
-    strncpy(t.type, TXN_TYPE_TRANSFER_IN, sizeof(t.type) - 1);
-    if (txn_append(txn, &t) != 0) { txn_rollback(txn, txn_size); goto done; }
-
+    /* 2. change both balances */
     src.balance = src_after;
     dst.balance = dst_after;
     if (customer_write_record(fd, from, &src) != 0 ||
         customer_write_record(fd, to,   &dst) != 0) {
         customer_write_record(fd, from, &src_before);     /* fallback: restore both rows ... */
         customer_write_record(fd, to,   &dst_before);
-        txn_rollback(txn, txn_size);                      /* ... and remove both log rows */
+        txn_finish(lfd, row_out, TXN_STATUS_VOID);        /* ... and void both log rows */
+        txn_finish(lfd, row_in,  TXN_STATUS_VOID);
+        goto done;
+    }
+
+    /* 3. commit both rows */
+    if (txn_finish(lfd, row_out, TXN_STATUS_COMMITTED) != 0 ||
+        txn_finish(lfd, row_in,  TXN_STATUS_COMMITTED) != 0) {
+        customer_write_record(fd, from, &src_before);
+        customer_write_record(fd, to,   &dst_before);
+        txn_finish(lfd, row_out, TXN_STATUS_VOID);
+        txn_finish(lfd, row_in,  TXN_STATUS_VOID);
         goto done;
     }
 
@@ -647,10 +663,10 @@ TxnStatus customer_transfer(int from_id, int to_id, double amount, double *new_b
     status = TXN_OK;
 
 done:
-    if (txn) txn_close_unlock(txn);                       /* release in reverse order */
-    if (hi_locked) customer_unlock(fd, hi);
+    if (lfd >= 0) close(lfd);
+    if (hi_locked) customer_unlock(fd, hi);               /* release in reverse order */
     if (lo_locked) customer_unlock(fd, lo);
-    close(fd);                                            /* close only after unlocking */
+    close(fd);
     return status;
 }
 

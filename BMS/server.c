@@ -12,6 +12,8 @@
 #include "utils.h"
 #include "auth.h"
 #include "customer.h"
+#include "staff.h"
+#include "employee.h"
 /* Reap finished children so they don't become zombies. */
 static void sigchld_handler(int sig) {
     (void)sig;
@@ -50,7 +52,8 @@ static void handle_client(int client_fd) {
             send_message(client_fd, "Invalid choice.\n");
             continue;
         }
-        if (choice != ROLE_CUSTOMER) {
+
+        if (choice != ROLE_CUSTOMER && choice != ROLE_EMPLOYEE) {
             send_message(client_fd, "This role will be implemented in a later step.\n");
             continue;
         }
@@ -58,8 +61,12 @@ static void handle_client(int client_fd) {
         int r = auth_prompt_login(client_fd, choice, &session);
         if (r == LOGIN_DISCONNECTED) break;
         if (r == LOGIN_OK) {
-            customer_menu(client_fd, &session);
-            auth_logout(&session);       /* always release the session, even if client dropped */
+            if (choice == ROLE_CUSTOMER) {
+                customer_menu(client_fd, &session);
+            } else {
+                employee_menu(client_fd, &session);
+                auth_logout(&session);
+            }       /* always release the session, even if client dropped */
         }
     }
 }
@@ -104,6 +111,18 @@ int main(void) {
         fprintf(stderr, "%s is missing or not in the fixed-width record format "
                         "(%d bytes per row). Convert it, then restart.\n",
                 CUSTOMER_FILE, RECORD_SIZE);
+        exit(EXIT_FAILURE);
+    }
+    
+    if (staff_validate_file(ROLE_EMPLOYEE) != 0) {
+        fprintf(stderr, "%s is not in the fixed-width format (%d bytes per row). "
+                        "Recreate it, then restart.\n", EMPLOYEE_FILE, STAFF_RECORD_SIZE);
+        exit(EXIT_FAILURE);
+    }
+    
+    if (customer_validate_logs() != 0) {
+        fprintf(stderr, "%s or %s is not in the fixed-width log format. "
+                        "Move the old files aside and restart.\n", TXN_FILE, FEEDBACK_FILE);
         exit(EXIT_FAILURE);
     }
 

@@ -50,4 +50,7 @@ PasswordStatus customer_change_password(int user_id, const char *old_pw, const c
 
 void customer_menu(int fd, Session *session);
 
+int customer_validate_logs(void); 
+    /* startup check for transaction.csv and feedback.csv */
+
 #endif

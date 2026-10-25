@@ -1,2 +1,1 @@
-txn_id,customer_id,type,amount,balance_after,timestamp
-1,1001,DEPOSIT,1.00,15001.00,1792834203
+txn_id    ,cust  ,peer  ,type        ,        amount, balance_after,timestamp   ,s

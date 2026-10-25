@@ -49,13 +49,23 @@ typedef struct {
 #define TXN_TYPE_TRANSFER_OUT "TRANSFER_OUT"
 #define TXN_TYPE_TRANSFER_IN  "TRANSFER_IN"
 
+/* transaction.csv and feedback.csv are append-only, fixed-width files: row 0 = header, row n at n * size */
+#define TXN_RECORD_SIZE       83
+#define FEEDBACK_RECORD_SIZE  230
+
+#define TXN_STATUS_PENDING    'P'
+#define TXN_STATUS_COMMITTED  'C'
+#define TXN_STATUS_VOID       'V'
+
 typedef struct {
-    int    id;
+    int    id;                 /* = row number in transaction.csv */
     int    customer_id;
-    char   type[16];        /* DEPOSIT, WITHDRAW, ... */
+    int    peer_id;            /* other account in a transfer, 0 otherwise */
+    char   type[16];           /* DEPOSIT, WITHDRAW, TRANSFER_OUT, TRANSFER_IN */
     double amount;
     double balance_after;
-    long   timestamp;       /* seconds since epoch */
+    long   timestamp;          /* seconds since epoch */
+    char   status;             /* P = pending, C = committed, V = void */
 } Transaction;
 
 #define FEEDBACK_FILE     "feedback.csv"
@@ -71,5 +81,27 @@ typedef struct {
 
 #define MIN_PASSWORD_LEN  6
 #define MAX_PASSWORD_LEN  20
+
+#define EMPLOYEE_FILE      "employee.csv"
+#define MANAGER_FILE       "manager.csv"
+#define ADMIN_FILE         "admin.csv"
+#define STAFF_RECORD_SIZE  95        /* bytes per staff row, including the newline */
+
+/* One layout for all staff roles; each role has its own file */
+typedef struct {
+    int  id;
+    char firstname[50];
+    char lastname[50];
+    char username[50];
+    char password[50];
+    int  active;
+    int  logged_in;
+} Staff;
+
+typedef Staff Employee;
+typedef Staff Manager;
+typedef Staff Admin;
+
+
 
 #endif

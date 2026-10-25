@@ -20,4 +20,11 @@ int     unlock_file(int fd);
 int lock_record(int fd, short type, off_t start, off_t len);
 int unlock_record(int fd, off_t start, off_t len);
 
+/* Append-only fixed-width files: row 0 = header, row n at offset n * row_size. */
+long log_reserve(int fd, int row_size);     /* new row number (>= 1); that row stays exclusively locked; -1 on error */
+int  log_write_row(int fd, long row_no, int row_size, const char *row);   /* pwrite + fsync */
+int  log_release_row(int fd, long row_no, int row_size);                  /* unlock the row */
+long log_row_count(int fd, int row_size);   /* number of data rows, -1 if the file size is not a multiple of row_size */
+int  log_validate_file(const char *path, int row_size, const char *header);   /* create with header if missing, else verify */
+
 #endif
