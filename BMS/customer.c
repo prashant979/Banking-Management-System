@@ -561,77 +561,92 @@ TxnStatus customer_withdraw(int user_id, double amount, double *new_balance) {
     return apply_transaction(user_id, amount, TXN_TYPE_WITHDRAW, 1, new_balance);
 }
 
-/* Debit sender, credit recipient, two log rows, one atomic commit.
+/* Debit sender, credit recipient, two log rows. Locks exactly TWO records, always the
+   lower position first, so two opposite transfers (A->B and B->A) can never deadlock.
    On success *new_balance is the SENDER's balance afterwards.
    On TXN_INSUFFICIENT_FUNDS *new_balance is the sender's current balance. */
 TxnStatus customer_transfer(int from_id, int to_id, double amount, double *new_balance) {
     TxnStatus status = TXN_IO_ERROR;
-    Customer *list = NULL;
     FILE *txn = NULL;
     long txn_size = 0;
-    int n, from = -1, to = -1;
-    double from_after, to_after;
+    int from, to, lo, hi, lo_locked = 0, hi_locked = 0;
+    double src_after, dst_after;
+    Customer src, dst, src_before, dst_before;
     Transaction t;
 
     if (from_id == to_id) return TXN_SAME_ACCOUNT;
 
-    FILE *fp = customer_open_locked(F_WRLCK);           /* one lock covers BOTH accounts */
-    if (!fp) return TXN_IO_ERROR;
+    int fd = customer_open();
+    if (fd < 0) return TXN_IO_ERROR;
 
-    n = customer_read_all(fp, &list);
-    if (n < 0) goto done;
+    from = customer_find_by_id(fd, from_id);              /* lock-free locate */
+    to   = customer_find_by_id(fd, to_id);
+    if (from == -2 || to == -2) goto done;
+    if (from < 0) { status = TXN_NOT_FOUND;         goto done; }
+    if (to   < 0) { status = TXN_RECIPIENT_INVALID; goto done; }
 
-    for (int i = 0; i < n; i++) {
-        if (list[i].id == from_id)    from = i;
-        else if (list[i].id == to_id) to = i;
-    }
-    if (from < 0)           { status = TXN_NOT_FOUND;         goto done; }
-    if (!list[from].active) { status = TXN_INACTIVE;          goto done; }
-    if (to < 0 || !list[to].active) { status = TXN_RECIPIENT_INVALID; goto done; }
+    /* Global lock order: lower record position first, whichever direction the money flows */
+    lo = (from < to) ? from : to;
+    hi = (from < to) ? to : from;
 
-    if (to_cents(list[from].balance) < to_cents(amount)) {
-        *new_balance = list[from].balance;
+    if (customer_lock(fd, lo, F_WRLCK) < 0) goto done;
+    lo_locked = 1;
+    if (customer_lock(fd, hi, F_WRLCK) < 0) goto done;
+    hi_locked = 1;
+
+    /* Everything below uses copies read AFTER both locks are held */
+    if (customer_read_record(fd, from, &src) != 0 || src.id != from_id) goto done;
+    if (customer_read_record(fd, to,   &dst) != 0 || dst.id != to_id)   goto done;
+
+    if (!src.active) { status = TXN_INACTIVE;          goto done; }
+    if (!dst.active) { status = TXN_RECIPIENT_INVALID; goto done; }
+
+    if (to_cents(src.balance) < to_cents(amount)) {
+        *new_balance = src.balance;
         status = TXN_INSUFFICIENT_FUNDS;
         goto done;
     }
 
-    from_after = round2(list[from].balance - amount);
-    to_after   = round2(list[to].balance + amount);
+    src_before = src;                                     /* before-images for undo */
+    dst_before = dst;
+    src_after  = round2(src.balance - amount);
+    dst_after  = round2(dst.balance + amount);
 
-    txn = txn_open_locked(&txn_size);
+    txn = txn_open_locked(&txn_size);                     /* lock order: records, then the log */
     if (!txn) goto done;
 
-    /* log row 1: sender */
-    memset(&t, 0, sizeof(t));
+    memset(&t, 0, sizeof(t));                             /* log row 1: sender */
     t.customer_id   = from_id;
     t.amount        = amount;
-    t.balance_after = from_after;
+    t.balance_after = src_after;
     strncpy(t.type, TXN_TYPE_TRANSFER_OUT, sizeof(t.type) - 1);
     if (txn_append(txn, &t) != 0) { txn_rollback(txn, txn_size); goto done; }
 
-    /* log row 2: recipient */
-    memset(&t, 0, sizeof(t));
+    memset(&t, 0, sizeof(t));                             /* log row 2: recipient */
     t.customer_id   = to_id;
     t.amount        = amount;
-    t.balance_after = to_after;
+    t.balance_after = dst_after;
     strncpy(t.type, TXN_TYPE_TRANSFER_IN, sizeof(t.type) - 1);
     if (txn_append(txn, &t) != 0) { txn_rollback(txn, txn_size); goto done; }
 
-    /* commit: both balances change in ONE atomic file replacement */
-    list[from].balance = from_after;
-    list[to].balance   = to_after;
-    if (customer_write_all(list, n) != 0) {
-        txn_rollback(txn, txn_size);                    /* removes BOTH log rows */
+    src.balance = src_after;
+    dst.balance = dst_after;
+    if (customer_write_record(fd, from, &src) != 0 ||
+        customer_write_record(fd, to,   &dst) != 0) {
+        customer_write_record(fd, from, &src_before);     /* fallback: restore both rows ... */
+        customer_write_record(fd, to,   &dst_before);
+        txn_rollback(txn, txn_size);                      /* ... and remove both log rows */
         goto done;
     }
 
-    *new_balance = from_after;
+    *new_balance = src_after;
     status = TXN_OK;
 
 done:
-    if (txn) txn_close_unlock(txn);
-    free(list);
-    customer_close_unlock(fp);
+    if (txn) txn_close_unlock(txn);                       /* release in reverse order */
+    if (hi_locked) customer_unlock(fd, hi);
+    if (lo_locked) customer_unlock(fd, lo);
+    close(fd);                                            /* close only after unlocking */
     return status;
 }
 
