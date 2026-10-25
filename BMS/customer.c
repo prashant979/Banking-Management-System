@@ -6,104 +6,243 @@
 #include <errno.h>
 #include <time.h>
 #include <ctype.h>
+#include <sys/stat.h>
 #include "common.h"
 #include "utils.h"
 #include "auth.h"
 #include "customer.h"
 
+
 #define HISTORY_LIMIT 20
 
-/* =====================  customer.csv storage  ===================== */
+/* =====================  customer.csv: fixed-width record store  ===================== */
+/*
+ * Row 0 is the header; customer number i (0-based) is row i+1. Every row is exactly
+ * RECORD_SIZE bytes:  id(6),first(20),last(20),user(20),pass(20),balance(14),active,logged_in\n
+ * so a customer is a fixed byte range of the file that can be locked with fcntl.
+ */
 
-/* The lock lives on a separate, never-replaced file, because customer.csv itself
-   gets replaced by rename(). One request at a time per process, so a static is fine. */
-static int g_lock_fd = -1;
+#define ROW_FMT "%-6d,%-20s,%-20s,%-20s,%-20s,%14.2f,%d,%d\n"
+
+static off_t record_offset(int idx) {
+    return (off_t)(idx + 1) * RECORD_SIZE;
+}
+
+static void trim_right(char *s) {
+    size_t len = strlen(s);
+    while (len > 0 && s[len - 1] == ' ') s[--len] = '\0';
+}
+
+/* Row text -> Customer. Returns 0 if the row is well formed. */
+static int record_parse(const char *row, Customer *c) {
+    char buf[RECORD_SIZE + 1];
+    memcpy(buf, row, RECORD_SIZE);
+    buf[RECORD_SIZE] = '\0';
+    if (buf[RECORD_SIZE - 1] != '\n') return -1;
+
+    memset(c, 0, sizeof(*c));
+    /* "%d ," : the space lets sscanf skip the padding after the id */
+    int n = sscanf(buf, "%d ,%20[^,],%20[^,],%20[^,],%20[^,],%lf,%d,%d",
+                   &c->id, c->firstname, c->lastname, c->username, c->password,
+                   &c->balance, &c->active, &c->logged_in);
+    if (n != 8) return -1;
+
+    trim_right(c->firstname);
+    trim_right(c->lastname);
+    trim_right(c->username);
+    trim_right(c->password);
+    return 0;
+}
+
+static int field_ok(const char *s) {
+    return strlen(s) <= CUSTOMER_FIELD_LEN && strchr(s, ',') == NULL && strchr(s, '\n') == NULL;
+}
+
+/* Customer -> row text (RECORD_SIZE bytes + NUL in out). Refuses anything that would
+   not fit the fixed layout, so a bad value can never shift the rows. */
+static int record_format(const Customer *c, char *out) {
+    if (!field_ok(c->firstname) || !field_ok(c->lastname) ||
+        !field_ok(c->username)  || !field_ok(c->password))
+        return -1;
+    int n = snprintf(out, RECORD_SIZE + 1, ROW_FMT,
+                     c->id, c->firstname, c->lastname, c->username, c->password,
+                     c->balance, c->active ? 1 : 0, c->logged_in ? 1 : 0);
+    return (n == RECORD_SIZE) ? 0 : -1;
+}
+
+static void header_row(char *out) {
+    snprintf(out, RECORD_SIZE + 1, "%-6s,%-20s,%-20s,%-20s,%-20s,%14s,%s,%s\n",
+             "id", "firstname", "lastname", "username", "password", "balance", "a", "l");
+}
+
+/* Open the data file ONCE per request and keep the descriptor until all locks are released:
+   closing any descriptor of a file drops ALL of this process's fcntl locks on it. */
+int customer_open(void) {
+    return open(CUSTOMER_FILE, O_RDWR);
+}
+
+int customer_count(int fd) {
+    struct stat st;
+    if (fstat(fd, &st) < 0) return -1;
+    if (st.st_size < RECORD_SIZE || st.st_size % RECORD_SIZE != 0) return -1;
+    return (int)(st.st_size / RECORD_SIZE) - 1;
+}
+
+int customer_lock(int fd, int idx, short type) {
+    return lock_record(fd, type, record_offset(idx), RECORD_SIZE);
+}
+
+int customer_unlock(int fd, int idx) {
+    return unlock_record(fd, record_offset(idx), RECORD_SIZE);
+}
+
+int customer_read_record(int fd, int idx, Customer *c) {
+    char row[RECORD_SIZE];
+    ssize_t n;
+    do {
+        n = pread(fd, row, RECORD_SIZE, record_offset(idx));
+    } while (n < 0 && errno == EINTR);
+    if (n != RECORD_SIZE) return -1;
+    return record_parse(row, c);
+}
+
+/* Caller must hold an exclusive lock on this record. */
+int customer_write_record(int fd, int idx, const Customer *c) {
+    char row[RECORD_SIZE + 1];
+    if (record_format(c, row) != 0) return -1;
+    if (pwrite(fd, row, RECORD_SIZE, record_offset(idx)) != RECORD_SIZE) return -1;
+    return (fsync(fd) == 0) ? 0 : -1;
+}
+
+/* Lock-free LOCATE: finds which record holds this username (or id). It is only a hint;
+   callers lock the record and re-read it before trusting anything in it. */
+static int find_customer(int fd, const char *username, int id) {
+    int n = customer_count(fd);
+    if (n < 0) return -2;
+    for (int i = 0; i < n; i++) {
+        Customer c;
+        if (customer_read_record(fd, i, &c) != 0) continue;
+        if (username ? (strcmp(c.username, username) == 0) : (c.id == id)) return i;
+    }
+    return -1;
+}
+
+int customer_find_by_username(int fd, const char *username) {
+    return find_customer(fd, username, 0);
+}
+
+int customer_find_by_id(int fd, int id) {
+    return find_customer(fd, NULL, id);
+}
+
+/* Startup check: create the file with its header if missing, then verify every row. */
+int customer_validate_file(void) {
+    int fd = open(CUSTOMER_FILE, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) return -1;
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) { close(fd); return -1; }
+
+    if (st.st_size == 0) {
+        char hdr[RECORD_SIZE + 1];
+        header_row(hdr);
+        int ok = (write(fd, hdr, RECORD_SIZE) == RECORD_SIZE) && (fsync(fd) == 0);
+        close(fd);
+        return ok ? 0 : -1;
+    }
+
+    int n = customer_count(fd);
+    int rc = (n < 0) ? -1 : 0;
+    for (int i = 0; rc == 0 && i < n; i++) {
+        Customer c;
+        if (customer_read_record(fd, i, &c) != 0) rc = -1;
+    }
+    close(fd);
+    return rc;
+}
+
+/* ---- Compatibility layer for operations not yet converted to per-record locking ----
+   customer_open_locked() locks the WHOLE byte range, i.e. every record at once. That
+   overlaps any record lock held by another process, so old-style and new-style code
+   still exclude each other. Converted away one operation at a time. */
+
+static int g_whole_fd = -1;           /* one request at a time per process */
 
 FILE *customer_open_locked(short lock_type) {
-    int lfd = open(CUSTOMER_LOCK_FILE, O_RDWR | O_CREAT, 0644);
-    if (lfd < 0) return NULL;
-    if (lock_file(lfd, lock_type) < 0) { close(lfd); return NULL; }
+    int fd = customer_open();
+    if (fd < 0) return NULL;
+    if (lock_record(fd, lock_type, 0, 0) < 0) { close(fd); return NULL; }
 
-    int dfd = open(CUSTOMER_FILE, O_RDONLY | O_CREAT, 0644);
-    FILE *fp = (dfd >= 0) ? fdopen(dfd, "r") : NULL;
-    if (!fp) {
-        if (dfd >= 0) close(dfd);
-        unlock_file(lfd);
-        close(lfd);
-        return NULL;
-    }
-    g_lock_fd = lfd;
+    FILE *fp = fdopen(fd, "r");       /* only a handle: data is read with pread */
+    if (!fp) { unlock_record(fd, 0, 0); close(fd); return NULL; }
+    g_whole_fd = fd;
     return fp;
 }
 
 void customer_close_unlock(FILE *fp) {
+    unlock_record(fileno(fp), 0, 0);
+    g_whole_fd = -1;
     fclose(fp);
-    if (g_lock_fd >= 0) {
-        unlock_file(g_lock_fd);
-        close(g_lock_fd);
-        g_lock_fd = -1;
-    }
-}
-
-/* Returns 0 for a valid record; header/blank/bad lines return -1 and are skipped. */
-static int customer_parse_line(const char *line, Customer *c) {
-    memset(c, 0, sizeof(*c));
-    int n = sscanf(line, "%d,%49[^,],%49[^,],%49[^,],%49[^,],%lf,%d,%d",
-                   &c->id, c->firstname, c->lastname, c->username, c->password,
-                   &c->balance, &c->active, &c->logged_in);
-    return (n == 8) ? 0 : -1;
 }
 
 int customer_read_all(FILE *fp, Customer **out) {
-    int cap = 16, n = 0;
-    Customer *arr = malloc(cap * sizeof(Customer));
-    if (!arr) return -1;
+    int fd = fileno(fp);
+    int n = customer_count(fd);
+    if (n < 0) return -1;
 
-    char line[512];
-    rewind(fp);
-    while (fgets(line, sizeof(line), fp)) {
-        Customer c;
-        if (customer_parse_line(line, &c) != 0) continue;
-        if (n == cap) {
-            cap *= 2;
-            Customer *tmp = realloc(arr, cap * sizeof(Customer));
-            if (!tmp) { free(arr); return -1; }
-            arr = tmp;
-        }
-        arr[n++] = c;
+    Customer *arr = malloc((n > 0 ? n : 1) * sizeof(Customer));
+    if (!arr) return -1;
+    for (int i = 0; i < n; i++) {
+        if (customer_read_record(fd, i, &arr[i]) != 0) { free(arr); return -1; }
     }
     *out = arr;
     return n;
 }
 
-/* All-or-nothing: write temp file, fsync, atomically rename over the real file.
-   On any failure the old customer.csv is left untouched. */
+/* Writes only the rows that changed. All rows are validated before the first write, and if
+   a write fails the rows already written are restored, so the caller still gets all-or-nothing. */
 int customer_write_all(const Customer *arr, int n) {
-    const char *tmp_path = CUSTOMER_FILE ".tmp";
+    int fd = g_whole_fd, i, j, failed = 0, rc = -1;
+    char *oldrows = NULL, *newrows = NULL;
+    char tmp[RECORD_SIZE + 1];
 
-    FILE *out = fopen(tmp_path, "w");
-    if (!out) return -1;
+    if (fd < 0) return -1;
+    if (n == 0) return 0;
 
-    fprintf(out, "%s\n", CUSTOMER_HEADER);
-    for (int i = 0; i < n; i++) {
-        fprintf(out, "%d,%s,%s,%s,%s,%.2f,%d,%d\n",
-                arr[i].id, arr[i].firstname, arr[i].lastname,
-                arr[i].username, arr[i].password,
-                arr[i].balance, arr[i].active, arr[i].logged_in);
+    oldrows = malloc((size_t)n * RECORD_SIZE);
+    newrows = malloc((size_t)n * RECORD_SIZE);
+    if (!oldrows || !newrows) goto done;
+
+    for (i = 0; i < n; i++) {                       /* 1. validate before touching the file */
+        if (record_format(&arr[i], tmp) != 0) goto done;
+        memcpy(newrows + (size_t)i * RECORD_SIZE, tmp, RECORD_SIZE);
+        if (pread(fd, oldrows + (size_t)i * RECORD_SIZE, RECORD_SIZE, record_offset(i)) != RECORD_SIZE)
+            goto done;
     }
 
-    if (ferror(out) || fflush(out) != 0 || fsync(fileno(out)) != 0) {
-        fclose(out);
-        unlink(tmp_path);
-        return -1;
+    for (i = 0; i < n && !failed; i++) {            /* 2. write only changed rows */
+        char *o = oldrows + (size_t)i * RECORD_SIZE;
+        char *w = newrows + (size_t)i * RECORD_SIZE;
+        if (memcmp(o, w, RECORD_SIZE) != 0 &&
+            pwrite(fd, w, RECORD_SIZE, record_offset(i)) != RECORD_SIZE)
+            failed = 1;
     }
-    if (fclose(out) != 0) { unlink(tmp_path); return -1; }
 
-    if (rename(tmp_path, CUSTOMER_FILE) != 0) { unlink(tmp_path); return -1; }
+    if (failed) {                                   /* 3. fallback: put the old rows back */
+        for (j = 0; j <= i && j < n; j++) {
+            ssize_t r = pwrite(fd, oldrows + (size_t)j * RECORD_SIZE, RECORD_SIZE, record_offset(j));
+            (void)r;
+        }
+        fsync(fd);
+        goto done;
+    }
+    if (fsync(fd) != 0) goto done;
+    rc = 0;
 
-    int dfd = open(".", O_RDONLY);          /* make the rename itself durable */
-    if (dfd >= 0) { fsync(dfd); close(dfd); }
-    return 0;
+done:
+    free(oldrows);
+    free(newrows);
+    return rc;
 }
 
 /* =====================  transaction.csv helpers  ===================== */
@@ -195,27 +334,6 @@ static int parse_account_id(const char *s, int *out) {
     if (v <= 0) return -1;
     *out = v;
     return 0;
-}
-/* Reads the latest balance under a SHARED lock. */
-int customer_get_balance(int user_id, double *balance) {
-    FILE *fp = customer_open_locked(F_RDLCK);
-    if (!fp) return -1;
-
-    Customer *list = NULL;
-    int n = customer_read_all(fp, &list);
-    int rc = -1;
-    if (n >= 0) {
-        for (int i = 0; i < n; i++) {
-            if (list[i].id == user_id) {
-                *balance = list[i].balance;
-                rc = 0;
-                break;
-            }
-        }
-        free(list);
-    }
-    customer_close_unlock(fp);
-    return rc;
 }
 
 /* Returns this customer's transactions, oldest first, read under a SHARED lock.

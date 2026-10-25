@@ -16,4 +16,8 @@ void    trim_newline(char *s);
 int     lock_file(int fd, short type);
 int     unlock_file(int fd);
 
+/* fcntl byte-range (record) locks. type: F_RDLCK / F_WRLCK. Blocks until granted. */
+int lock_record(int fd, short type, off_t start, off_t len);
+int unlock_record(int fd, off_t start, off_t len);
+
 #endif

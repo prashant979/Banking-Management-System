@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include "common.h"
 #include "utils.h"
 #include "customer.h"
@@ -8,59 +10,63 @@
 
 #define MAX_LOGIN_ATTEMPTS 3
 
-/* Check credentials AND set logged_in = 1 under ONE exclusive lock,
-   so two simultaneous logins for the same account cannot both succeed. */
+/* Locate -> lock ONE record -> re-check under the lock -> set logged_in.
+   Only this customer's 110 bytes are locked, so other customers are never blocked. */
 static AuthStatus login_customer(const char *username, const char *password, Session *s) {
-    FILE *fp = customer_open_locked(F_WRLCK);
-    if (!fp) return AUTH_ERROR;
+    int fd = customer_open();
+    if (fd < 0) return AUTH_ERROR;
 
-    Customer *list = NULL;
-    int n = customer_read_all(fp, &list);
-    if (n < 0) { customer_close_unlock(fp); return AUTH_ERROR; }
+    int idx = customer_find_by_username(fd, username);       /* lock-free hint */
+    if (idx == -2) { close(fd); return AUTH_ERROR; }
+    if (idx < 0)   { close(fd); return AUTH_INVALID_CREDENTIALS; }
 
-    AuthStatus status = AUTH_INVALID_CREDENTIALS;
-    for (int i = 0; i < n; i++) {
-        if (strcmp(list[i].username, username) != 0) continue;
-        if (strcmp(list[i].password, password) != 0) break;   /* same status as "no such user" */
+    if (customer_lock(fd, idx, F_WRLCK) < 0) { close(fd); return AUTH_ERROR; }
 
-        /* Password is correct: only now reveal account state */
-        if (!list[i].active)    { status = AUTH_ACCOUNT_INACTIVE;  break; }
-        if (list[i].logged_in)  { status = AUTH_ALREADY_LOGGED_IN; break; }
-
-        list[i].logged_in = 1;
-        if (customer_write_all(fp, list, n) != 0) { status = AUTH_ERROR; break; }
-
-        memset(s, 0, sizeof(*s));
-        s->role      = ROLE_CUSTOMER;
-        s->user_id   = list[i].id;
-        s->logged_in = 1;
-        strncpy(s->username, list[i].username, sizeof(s->username) - 1);
-        status = AUTH_OK;
-        break;
+    AuthStatus status;
+    Customer c;
+    if (customer_read_record(fd, idx, &c) != 0) {
+        status = AUTH_ERROR;
+    } else if (strcmp(c.username, username) != 0 || strcmp(c.password, password) != 0) {
+        status = AUTH_INVALID_CREDENTIALS;        /* also covers "record changed since the scan" */
+    } else if (!c.active) {
+        status = AUTH_ACCOUNT_INACTIVE;
+    } else if (c.logged_in) {
+        status = AUTH_ALREADY_LOGGED_IN;
+    } else {
+        c.logged_in = 1;
+        if (customer_write_record(fd, idx, &c) != 0) {
+            status = AUTH_ERROR;
+        } else {
+            memset(s, 0, sizeof(*s));
+            s->role      = ROLE_CUSTOMER;
+            s->user_id   = c.id;
+            s->logged_in = 1;
+            strncpy(s->username, c.username, sizeof(s->username) - 1);
+            status = AUTH_OK;
+        }
     }
 
-    free(list);
-    customer_close_unlock(fp);
+    customer_unlock(fd, idx);
+    close(fd);                                    /* close only AFTER unlocking */
     return status;
 }
 
 static void logout_customer(int user_id) {
-    FILE *fp = customer_open_locked(F_WRLCK);
-    if (!fp) return;
+    int fd = customer_open();
+    if (fd < 0) return;
 
-    Customer *list = NULL;
-    int n = customer_read_all(fp, &list);
-    if (n >= 0) {
-        for (int i = 0; i < n; i++) {
-            if (list[i].id == user_id) { list[i].logged_in = 0; break; }
+    int idx = customer_find_by_id(fd, user_id);
+    if (idx >= 0 && customer_lock(fd, idx, F_WRLCK) == 0) {
+        Customer c;
+        if (customer_read_record(fd, idx, &c) == 0 && c.id == user_id) {
+            c.logged_in = 0;
+            customer_write_record(fd, idx, &c);
         }
-        customer_write_all(fp, list, n);
-        free(list);
+        customer_unlock(fd, idx);
     }
-    customer_close_unlock(fp);
+    close(fd);
 }
 
-/* Role dispatch: add Employee/Manager/Admin cases in later steps */
 AuthStatus auth_login(int role, const char *username, const char *password, Session *s) {
     switch (role) {
     case ROLE_CUSTOMER: return login_customer(username, password, s);
@@ -114,19 +120,24 @@ int auth_prompt_login(int fd, int role, Session *s) {
     return LOGIN_FAILED;
 }
 
-/* If the server or a client crashed, logged_in flags can be left at 1. Clear them at startup. */
+/* Clear stale logged_in flags left by a crash. Called once at server startup. */
 int auth_reset_sessions(void) {
-    FILE *fp = customer_open_locked(F_WRLCK);
-    if (!fp) return -1;
+    int fd = customer_open();
+    if (fd < 0) return -1;
 
-    Customer *list = NULL;
-    int n = customer_read_all(fp, &list);
-    int rc = -1;
-    if (n >= 0) {
-        for (int i = 0; i < n; i++) list[i].logged_in = 0;
-        rc = customer_write_all(fp, list, n);
-        free(list);
+    int n = customer_count(fd);
+    int rc = (n < 0) ? -1 : 0;
+    for (int i = 0; i < n; i++) {
+        if (customer_lock(fd, i, F_WRLCK) < 0) { rc = -1; continue; }
+        Customer c;
+        if (customer_read_record(fd, i, &c) != 0) {
+            rc = -1;
+        } else if (c.logged_in) {
+            c.logged_in = 0;
+            if (customer_write_record(fd, i, &c) != 0) rc = -1;
+        }
+        customer_unlock(fd, i);
     }
-    customer_close_unlock(fp);
+    close(fd);
     return rc;
 }

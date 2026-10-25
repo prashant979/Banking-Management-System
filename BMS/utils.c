@@ -87,3 +87,26 @@ int get_next_id_csv(FILE *fp) {
     }
     return max_id + 1;
 }
+
+int lock_record(int fd, short type, off_t start, off_t len) {
+    struct flock fl;
+    memset(&fl, 0, sizeof(fl));
+    fl.l_type   = type;
+    fl.l_whence = SEEK_SET;
+    fl.l_start  = start;          /* first byte of the record */
+    fl.l_len    = len;            /* length of the record; 0 = to end of file */
+    while (fcntl(fd, F_SETLKW, &fl) < 0) {
+        if (errno != EINTR) return -1;        /* includes EDEADLK */
+    }
+    return 0;
+}
+
+int unlock_record(int fd, off_t start, off_t len) {
+    struct flock fl;
+    memset(&fl, 0, sizeof(fl));
+    fl.l_type   = F_UNLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start  = start;
+    fl.l_len    = len;
+    return fcntl(fd, F_SETLK, &fl);
+}

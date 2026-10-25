@@ -12,6 +12,9 @@
 #define ROLE_MANAGER   3
 #define ROLE_ADMIN     4
 
+/* customer.csv is fixed-width: one customer = one 110-byte row = one lockable record */
+#define CUSTOMER_FIELD_LEN  20      /* width of firstname, lastname, username, password */
+#define RECORD_SIZE         110     /* bytes per row, including the newline */
 #define CUSTOMER_FILE    "customer.csv"
 #define CUSTOMER_HEADER  "id,firstname,lastname,username,password,balance,active,logged_in"
 
