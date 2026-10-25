@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include "utils.h"
 
 /* Writes the whole string, handling partial writes and EINTR. */
@@ -109,4 +110,75 @@ int unlock_record(int fd, off_t start, off_t len) {
     fl.l_start  = start;
     fl.l_len    = len;
     return fcntl(fd, F_SETLK, &fl);
+}
+
+/* Reserve the next row. The guard lock (header byte 0) is held only long enough to read the
+   file size, lock our own new row and extend the file with a blank row. No fsync happens here. */
+long log_reserve(int fd, int row_size) {
+    char blank[512];
+    struct stat st;
+
+    if (row_size < 2 || row_size > (int)sizeof(blank)) return -1;
+    if (lock_record(fd, F_WRLCK, 0, 1) < 0) return -1;              /* guard */
+
+    if (fstat(fd, &st) < 0 || st.st_size < row_size || st.st_size % row_size != 0) {
+        unlock_record(fd, 0, 1);
+        return -1;
+    }
+
+    off_t off = st.st_size;
+    long row_no = (long)(off / row_size);
+
+    if (lock_record(fd, F_WRLCK, off, row_size) < 0) {              /* our own new row, beyond EOF */
+        unlock_record(fd, 0, 1);
+        return -1;
+    }
+
+    memset(blank, ' ', row_size);
+    blank[row_size - 1] = '\n';
+    if (pwrite(fd, blank, row_size, off) != row_size) {             /* extends the file */
+        unlock_record(fd, off, row_size);
+        unlock_record(fd, 0, 1);
+        return -1;
+    }
+
+    unlock_record(fd, 0, 1);                                        /* guard released: others may reserve */
+    return row_no;
+}
+
+/* Caller holds the row lock from log_reserve (or took one itself). */
+int log_write_row(int fd, long row_no, int row_size, const char *row) {
+    if (pwrite(fd, row, row_size, (off_t)row_no * row_size) != row_size) return -1;
+    return (fsync(fd) == 0) ? 0 : -1;
+}
+
+int log_release_row(int fd, long row_no, int row_size) {
+    return unlock_record(fd, (off_t)row_no * row_size, row_size);
+}
+
+long log_row_count(int fd, int row_size) {
+    struct stat st;
+    if (fstat(fd, &st) < 0) return -1;
+    if (st.st_size < row_size || st.st_size % row_size != 0) return -1;
+    return (long)(st.st_size / row_size) - 1;
+}
+
+int log_validate_file(const char *path, int row_size, const char *header) {
+    struct stat st;
+    char last;
+
+    int fd = open(path, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) return -1;
+    if (fstat(fd, &st) < 0) { close(fd); return -1; }
+
+    if (st.st_size == 0) {                                          /* fresh install */
+        int ok = (write(fd, header, row_size) == row_size) && (fsync(fd) == 0);
+        close(fd);
+        return ok ? 0 : -1;
+    }
+
+    int ok = (st.st_size >= row_size && st.st_size % row_size == 0 &&
+              pread(fd, &last, 1, row_size - 1) == 1 && last == '\n');
+    close(fd);
+    return ok ? 0 : -1;
 }
