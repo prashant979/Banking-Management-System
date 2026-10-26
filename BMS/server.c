@@ -150,6 +150,13 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 
+    /* Crash recovery: runs before any client is accepted, so nothing else touches the files */
+    int rp = role_recover();
+    int cp = customer_recover();
+    if (rp != 0 || cp != 0) {
+        fprintf(stderr, "Warning: crash recovery could not resolve everything "
+                        "(see the messages above).\n");
+    }
 
     if (auth_reset_sessions() != 0) {
     	fprintf(stderr, "Warning: could not reset sessions in %s\n", CUSTOMER_FILE);

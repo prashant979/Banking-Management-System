@@ -18,4 +18,5 @@ int        role_validate_history(void);      /* startup: create or verify role_h
 RoleStatus role_change(int from_role, int from_id, int admin_id, int *to_role, int *to_id);
 int        role_history_for_user(const char *username, RoleChange *out, int max);   /* COMMITTED rows, oldest first */
 
+int role_recover(void); /* startup: roll back PENDING role changes */
 #endif
