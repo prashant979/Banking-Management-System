@@ -15,4 +15,5 @@ int staff_write_record(int fd, int idx, const Staff *s);       /* in place + fsy
 int staff_find_by_username(int fd, const char *username);      /* index, -1 not found, -2 error */
 int staff_find_by_id(int fd, int id);                          /* same return values */
 
+PasswordStatus staff_change_password(int role, int user_id, const char *old_pw, const char *new_pw);
 #endif

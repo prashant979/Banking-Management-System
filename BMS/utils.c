@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include "utils.h"
+#include "common.h"
 
 /* Writes the whole string, handling partial writes and EINTR. */
 int send_message(int fd, const char *msg) {
@@ -181,4 +182,16 @@ int log_validate_file(const char *path, int row_size, const char *header) {
               pread(fd, &last, 1, row_size - 1) == 1 && last == '\n');
     close(fd);
     return ok ? 0 : -1;
+}
+
+/* MIN_PASSWORD_LEN..MAX_PASSWORD_LEN printable ASCII characters, no spaces, no commas
+   (a comma would break the CSV row). One policy shared by every role. */
+int password_policy_ok(const char *pw) {
+    size_t len = strlen(pw);
+    if (len < MIN_PASSWORD_LEN || len > MAX_PASSWORD_LEN) return -1;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)pw[i];
+        if (c <= 32 || c >= 127 || c == ',') return -1;
+    }
+    return 0;
 }

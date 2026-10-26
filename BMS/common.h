@@ -103,5 +103,12 @@ typedef Staff Manager;
 typedef Staff Admin;
 
 #define CUSTOMER_ID_BASE  1000      /* customer id = 1000 + row number in customer.csv */
+typedef enum {
+    PW_OK = 0,
+    PW_WRONG_OLD,
+    PW_INVALID_NEW,
+    PW_SAME_AS_OLD,
+    PW_ERROR
+} PasswordStatus;
 
 #endif

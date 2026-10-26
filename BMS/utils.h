@@ -27,4 +27,6 @@ int  log_release_row(int fd, long row_no, int row_size);                  /* unl
 long log_row_count(int fd, int row_size);   /* number of data rows, -1 if the file size is not a multiple of row_size */
 int  log_validate_file(const char *path, int row_size, const char *header);   /* create with header if missing, else verify */
 
+int password_policy_ok(const char *pw);   /* 0 if acceptable, -1 otherwise */
+
 #endif

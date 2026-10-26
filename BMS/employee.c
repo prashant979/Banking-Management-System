@@ -199,8 +199,11 @@ void employee_menu(int fd, Session *session) {
         case 3:
             do_view_customer_transactions(fd, session);
             break;
-        case 4: case 5: case 6:
+        case 4: case 5:
             send_message(fd, "This feature will be implemented in a later step.\n");
+            break;
+        case 6:
+        auth_prompt_change_password(fd, session);
             break;
         case 7:
             send_message(fd, "Logged out.\n");

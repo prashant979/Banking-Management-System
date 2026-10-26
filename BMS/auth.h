@@ -23,4 +23,5 @@ int        auth_prompt_login(int fd, int role, Session *session);
 int        auth_require_role(const Session *session, int role);
 int        auth_reset_sessions(void);   /* clears stale logged_in flags (server startup) */
 
+void auth_prompt_change_password(int fd, const Session *session);   /* shared by every role */
 #endif
