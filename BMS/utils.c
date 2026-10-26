@@ -2,6 +2,8 @@
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ctype.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include "utils.h"
 #include "common.h"
@@ -193,5 +195,16 @@ int password_policy_ok(const char *pw) {
         unsigned char c = (unsigned char)pw[i];
         if (c <= 32 || c >= 127 || c == ',') return -1;
     }
+    return 0;
+}
+
+int parse_id(const char *s, int *out) {
+    size_t len = strlen(s);
+    if (len == 0 || len > 9) return -1;
+    for (size_t i = 0; i < len; i++)
+        if (!isdigit((unsigned char)s[i])) return -1;
+    int v = atoi(s);
+    if (v <= 0) return -1;
+    *out = v;
     return 0;
 }

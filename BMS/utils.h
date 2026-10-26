@@ -29,4 +29,5 @@ int  log_validate_file(const char *path, int row_size, const char *header);   /*
 
 int password_policy_ok(const char *pw);   /* 0 if acceptable, -1 otherwise */
 
+int parse_id(const char *s, int *out);     /* digits only, 1-9 chars, value > 0; 0 on success */
 #endif

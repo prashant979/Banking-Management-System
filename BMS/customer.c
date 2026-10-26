@@ -462,6 +462,57 @@ int customer_add_feedback(int user_id, const char *message) {
     return rc;
 }
 
+static int feedback_parse(const char *row, Feedback *f) {
+    char buf[FEEDBACK_RECORD_SIZE + 1];
+    memcpy(buf, row, FEEDBACK_RECORD_SIZE);
+    buf[FEEDBACK_RECORD_SIZE] = '\0';
+    if (buf[FEEDBACK_RECORD_SIZE - 1] != '\n') return -1;
+
+    memset(f, 0, sizeof(*f));
+    int n = sscanf(buf, "%d ,%d ,%ld ,%200[^\n]",
+                   &f->id, &f->customer_id, &f->timestamp, f->message);
+    if (n != 4) return -1;                              /* blank or damaged row */
+
+    trim_right(f->message);
+    return 0;
+}
+
+/* Each row is read under a SHARED lock on that row only, so a reader waits only if a writer
+   is on that very row. Feedback is append-only, so a page never changes once it exists. */
+int customer_feedback_page(int customer_id, long start_row, Feedback *out, int max, long *next_row) {
+    int n = 0;
+    *next_row = 0;
+    if (start_row < 1) start_row = 1;
+
+    int fd = open(FEEDBACK_FILE, O_RDONLY);
+    if (fd < 0) return -1;
+
+    long rows = log_row_count(fd, FEEDBACK_RECORD_SIZE);
+    if (rows < 0) { close(fd); return -1; }
+
+    for (long r = start_row; r <= rows; r++) {
+        off_t off = (off_t)r * FEEDBACK_RECORD_SIZE;
+        char row[FEEDBACK_RECORD_SIZE];
+        Feedback f;
+
+        if (lock_record(fd, F_RDLCK, off, FEEDBACK_RECORD_SIZE) < 0) continue;
+        ssize_t got = pread(fd, row, FEEDBACK_RECORD_SIZE, off);
+        unlock_record(fd, off, FEEDBACK_RECORD_SIZE);
+
+        if (got != FEEDBACK_RECORD_SIZE || feedback_parse(row, &f) != 0) continue;
+        if (customer_id != 0 && f.customer_id != customer_id) continue;
+
+        if (n == max) {                                  /* one more match: there is a next page */
+            *next_row = r;
+            break;
+        }
+        out[n++] = f;
+    }
+
+    close(fd);
+    return n;
+}
+
 /* Startup: create transaction.csv and feedback.csv with headers if missing, else verify the format. */
 int customer_validate_logs(void) {
     char hdr[FEEDBACK_RECORD_SIZE + 1];

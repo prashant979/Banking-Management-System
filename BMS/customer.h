@@ -72,4 +72,9 @@ ModStatus customer_modify(int id, const char *firstname, const char *lastname); 
 int customer_get_details(int id, Customer *out);   /* 0 ok, -1 not found/error; password blanked */
 
 void customer_send_history(int fd, int customer_id);   /* last 20 committed transactions, newest first */
+
+/* One page of feedback rows (oldest first) starting at row start_row. customer_id 0 = all customers.
+   Returns the number of rows in out (<= max), -1 on error. *next_row = start row of the next page,
+   or 0 if there are no more matching rows. */
+int customer_feedback_page(int customer_id, long start_row, Feedback *out, int max, long *next_row);
 #endif
