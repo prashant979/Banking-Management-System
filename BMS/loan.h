@@ -43,4 +43,5 @@ int  loan_page(int customer_id, int employee_id, const char *statuses,
                long start_row, Loan *out, int max, long *next_row);
 void loan_browser(int fd, int customer_id, int employee_id, const char *statuses, const char *title);
 
+int loan_revert_approval(int loan_id, int customer_id);  /* recovery only */
 #endif

@@ -762,6 +762,8 @@ static TxnStatus apply_transaction(int user_id, double amount,
         goto done;
     }
 
+    crash_point("deposit_before_hook"); /* test hook */
+
     if (txn_finish(lfd, row_no, TXN_STATUS_COMMITTED) != 0) {   /* 3. commit */
         customer_write_record(fd, idx, &before);
         txn_finish(lfd, row_no, TXN_STATUS_VOID);
@@ -842,8 +844,16 @@ TxnStatus customer_transfer(int from_id, int to_id, double amount, double *new_b
     /* 2. change both balances */
     src.balance = src_after;
     dst.balance = dst_after;
-    if (customer_write_record(fd, from, &src) != 0 ||
-        customer_write_record(fd, to,   &dst) != 0) {
+    if (customer_write_record(fd, from, &src) != 0) {
+        customer_write_record(fd, from, &src_before);
+        txn_finish(lfd, row_out, TXN_STATUS_VOID);
+        txn_finish(lfd, row_in,  TXN_STATUS_VOID);
+        goto done;
+    }
+
+    crash_point("transfer_mid");                          /* test hook: sender debited, receiver not */
+
+    if (customer_write_record(fd, to, &dst) != 0) {
         customer_write_record(fd, from, &src_before);     /* fallback: restore both rows ... */
         customer_write_record(fd, to,   &dst_before);
         txn_finish(lfd, row_out, TXN_STATUS_VOID);        /* ... and void both log rows */
@@ -851,14 +861,21 @@ TxnStatus customer_transfer(int from_id, int to_id, double amount, double *new_b
         goto done;
     }
 
-    /* 3. commit both rows */
-    if (txn_finish(lfd, row_out, TXN_STATUS_COMMITTED) != 0 ||
-        txn_finish(lfd, row_in,  TXN_STATUS_COMMITTED) != 0) {
+    /* 3. commit point = the OUT row becoming COMMITTED */
+    if (txn_finish(lfd, row_out, TXN_STATUS_COMMITTED) != 0) {
         customer_write_record(fd, from, &src_before);
         customer_write_record(fd, to,   &dst_before);
         txn_finish(lfd, row_out, TXN_STATUS_VOID);
         txn_finish(lfd, row_in,  TXN_STATUS_VOID);
         goto done;
+    }
+
+    crash_point("transfer_after_out_commit");             /* test hook: committed, IN row still PENDING */
+
+    if (txn_finish(lfd, row_in, TXN_STATUS_COMMITTED) != 0) {
+        /* Already committed: never roll back now. Startup recovery completes the IN row. */
+        fprintf(stderr, "Warning: transfer committed but log row %ld is still PENDING; "
+                        "recovery will complete it\n", row_in);
     }
 
     *new_balance = src_after;
@@ -1208,7 +1225,129 @@ static void customer_loan_menu(int fd, const Session *session) {
     }
 }
 
+/* =====================  startup crash recovery  ===================== */
+
+static int txn_is_credit(const char *type) {
+    return strcmp(type, TXN_TYPE_DEPOSIT) == 0 ||
+           strcmp(type, TXN_TYPE_TRANSFER_IN) == 0 ||
+           strcmp(type, TXN_TYPE_LOAN_CREDIT) == 0;
+}
+
+static int txn_read_at(int lfd, long r, Transaction *t) {
+    char row[TXN_RECORD_SIZE];
+    if (pread(lfd, row, TXN_RECORD_SIZE, (off_t)r * TXN_RECORD_SIZE) != TXN_RECORD_SIZE) return -1;
+    return txn_parse(row, t);
+}
+
+/* The TRANSFER_OUT row belonging to a TRANSFER_IN row: the nearest earlier row for the same pair
+   and amount. Both accounts were locked for the whole transfer, so no other transfer between
+   them can sit in between. */
+static int txn_find_out_partner(int lfd, long in_row, const Transaction *in, Transaction *out) {
+    for (long r = in_row - 1; r >= 1; r--) {
+        Transaction t;
+        if (txn_read_at(lfd, r, &t) != 0) continue;
+        if (strcmp(t.type, TXN_TYPE_TRANSFER_OUT) == 0 &&
+            t.customer_id == in->peer_id && t.peer_id == in->customer_id &&
+            to_cents(t.amount) == to_cents(in->amount)) {
+            *out = t;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Puts one account into its state BEFORE (redo = 0) or AFTER (redo = 1) the logged transaction.
+   The record lock was held from PENDING until commit, so the balance can only be exactly
+   'before' or exactly 'after'. Anything else is reported, never guessed. Returns 0 or -1. */
+static int recover_balance(int cfd, const Transaction *t, int redo) {
+    int rc = -1;
+    int idx = customer_find_by_id(cfd, t->customer_id);
+    if (idx < 0) return -1;
+    if (customer_lock(cfd, idx, F_WRLCK) < 0) return -1;
+
+    Customer c;
+    if (customer_read_record(cfd, idx, &c) == 0 && c.id == t->customer_id) {
+        long long after  = to_cents(t->balance_after);
+        long long amount = to_cents(t->amount);
+        long long before = txn_is_credit(t->type) ? after - amount : after + amount;
+        long long want   = redo ? after : before;
+        long long other  = redo ? before : after;
+        long long now    = to_cents(c.balance);
+
+        if (now == want) {
+            rc = 0;                                       /* already in the right state */
+        } else if (now == other) {
+            c.balance = (double)want / 100.0;
+            rc = customer_write_record(cfd, idx, &c);
+        }
+    }
+    customer_unlock(cfd, idx);
+    return rc;
+}
+
+/* Runs once at startup, before any client connects. Undo uncommitted, redo committed.
+   Returns the number of rows that need manual review (0 = clean), or -1 on I/O error. */
+int customer_recover(void) {
+    int problems = 0, fixed = 0;
+    int cfd = customer_open();
+    int lfd = txn_open();
+    long rows;
+
+    if (cfd < 0 || lfd < 0) {
+        if (cfd >= 0) close(cfd);
+        if (lfd >= 0) close(lfd);
+        return -1;
+    }
+    rows = log_row_count(lfd, TXN_RECORD_SIZE);
+    if (rows < 0) { close(lfd); close(cfd); return -1; }
+
+    for (long r = 1; r <= rows; r++) {
+        Transaction t, out;
+        int redo = 0;
+
+        if (txn_read_at(lfd, r, &t) != 0 || t.status != TXN_STATUS_PENDING) continue;
+
+        /* a transfer is committed once its OUT row is COMMITTED: then finish the IN side */
+        if (strcmp(t.type, TXN_TYPE_TRANSFER_IN) == 0 &&
+            txn_find_out_partner(lfd, r, &t, &out) == 0 &&
+            out.status == TXN_STATUS_COMMITTED)
+            redo = 1;
+
+        if (recover_balance(cfd, &t, redo) != 0) {
+            printf("Recovery: transaction %d (%s, account %d) does not match the account's balance; "
+                   "left PENDING for manual review.\n", t.id, t.type, t.customer_id);
+            problems++;
+            continue;
+        }
+
+        if (!redo && strcmp(t.type, TXN_TYPE_LOAN_CREDIT) == 0 &&
+            loan_revert_approval(t.peer_id, t.customer_id) != 0) {   /* peer column = loan id */
+            printf("Recovery: could not set loan #%d back to Assigned; transaction %d left PENDING.\n",
+                   t.peer_id, t.id);
+            problems++;
+            continue;
+        }
+
+        if (txn_finish(lfd, r, redo ? TXN_STATUS_COMMITTED : TXN_STATUS_VOID) != 0) {
+            problems++;
+            continue;
+        }
+
+        printf("Recovery: transaction %d (%s, account %d, %.2f) %s.\n",
+               t.id, t.type, t.customer_id, t.amount, redo ? "completed" : "rolled back");
+        fixed++;
+    }
+
+    if (fixed || problems)
+        printf("Recovery: %d transaction(s) resolved, %d need manual review.\n", fixed, problems);
+
+    close(lfd);
+    close(cfd);
+    return problems;
+}
+
 void customer_menu(int fd, Session *session) {
+    
     char buf[BUFFER_SIZE], msg[BUFFER_SIZE];
 
     /* Role verification: refuse anyone who isn't a logged-in customer */

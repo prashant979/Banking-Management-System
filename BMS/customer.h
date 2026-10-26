@@ -84,4 +84,6 @@ long txn_begin(int lfd, int customer_id, int peer_id, const char *type,
                double amount, double balance_after);      /* writes a durable PENDING row */
 int  txn_finish(int lfd, long row_no, char status);         /* PENDING -> COMMITTED / VOID */
 
+int customer_recover(void);
+
 #endif

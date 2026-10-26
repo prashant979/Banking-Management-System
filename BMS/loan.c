@@ -293,6 +293,32 @@ static int loan_write_at(int fd, const Loan *l) {
     return (fsync(fd) == 0) ? 0 : -1;
 }
 
+/* Recovery: undo an approval that never committed. The loan goes back to Assigned with the same
+   employee. Idempotent: does nothing if it is already Assigned. */
+int loan_revert_approval(int loan_id, int customer_id) {
+    int rc = -1;
+    Loan l;
+    int lfd = open(LOAN_FILE, O_RDWR);
+    if (lfd < 0) return -1;
+
+    if (loan_exists(lfd, loan_id) &&
+        lock_record(lfd, F_WRLCK, loan_offset(loan_id), LOAN_RECORD_SIZE) == 0) {
+        if (loan_read_at(lfd, loan_id, &l) == 0 && l.customer_id == customer_id) {
+            if (l.status == LOAN_STATUS_ASSIGNED) {
+                rc = 0;
+            } else if (l.status == LOAN_STATUS_APPROVED) {
+                l.status     = LOAN_STATUS_ASSIGNED;
+                l.decided_at = 0;
+                rc = loan_write_at(lfd, &l);
+            }
+        }
+        unlock_record(lfd, loan_offset(loan_id), LOAN_RECORD_SIZE);
+    }
+    close(lfd);
+    return rc;
+}
+
+
 static double loan_round2(double x) {
     return (double)(long long)(x * 100.0 + 0.5) / 100.0;
 }
@@ -475,6 +501,8 @@ LoanResult loan_approve(int loan_id, int employee_id, double *new_balance) {
         loan_write_at(lfd, &lbefore);
         goto undo_balance;
     }
+
+    crash_point("approve_before_commit"); /* test hook */
 
     /* 6. commit */
     if (txn_finish(tfd, trow, TXN_STATUS_COMMITTED) != 0) {

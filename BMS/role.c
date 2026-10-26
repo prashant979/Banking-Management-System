@@ -185,6 +185,7 @@ RoleStatus role_change(int from_role, int from_id, int admin_id, int *to_role_ou
     }
 
     /* 5b. deactivate the old account */
+    crash_point("role_mid"); /* test hook: active in both roles */
     src.active = 0;
     if (staff_write_record(src_fd, src_idx, &src) != 0) goto undo;
 
@@ -237,4 +238,79 @@ int role_history_for_user(const char *username, RoleChange *out, int max) {
     }
     close(fd);
     return n;
+}
+
+/* Sets one staff account's active flag, but only if the row really belongs to `username`.
+   must_exist = 0: a missing or foreign row is skipped (the new account may never have been written). */
+static int recover_set_active(int role, int id, const char *username, int active, int must_exist) {
+    int rc = -1;
+    int fd = staff_open(role);
+    if (fd < 0) return -1;
+
+    int idx = staff_find_by_id(fd, id);
+    if (idx < 0) {
+        close(fd);
+        return (idx == -1 && !must_exist) ? 0 : -1;
+    }
+
+    if (staff_lock(fd, idx, F_WRLCK) == 0) {
+        Staff s;
+        if (staff_read_record(fd, idx, &s) == 0 && s.id == id && strcmp(s.username, username) == 0) {
+            if (s.active == active) {
+                rc = 0;
+            } else {
+                s.active    = active;
+                s.logged_in = 0;
+                rc = staff_write_record(fd, idx, &s);
+            }
+        } else if (!must_exist) {
+            rc = 0;
+        }
+        staff_unlock(fd, idx);
+    }
+    close(fd);
+    return rc;
+}
+
+/* Startup: every PENDING role change is rolled back (new-role account inactive, old one active).
+   Returns the number of rows needing manual review, or -1 on I/O error. */
+int role_recover(void) {
+    int problems = 0, fixed = 0;
+    int hfd = open(ROLE_HIST_FILE, O_RDWR);
+    if (hfd < 0) return -1;
+
+    long rows = log_row_count(hfd, ROLE_HIST_RECORD_SIZE);
+    if (rows < 0) { close(hfd); return -1; }
+
+    for (long r = 1; r <= rows; r++) {
+        char row[ROLE_HIST_RECORD_SIZE];
+        RoleChange h;
+
+        if (pread(hfd, row, ROLE_HIST_RECORD_SIZE, (off_t)r * ROLE_HIST_RECORD_SIZE) != ROLE_HIST_RECORD_SIZE)
+            continue;
+        if (hist_parse(row, &h) != 0 || h.status != TXN_STATUS_PENDING) continue;
+
+        /* undo in reverse order: new-role account first, then the old one */
+        if (recover_set_active(h.to_role, h.to_id, h.username, 0, 0) != 0 ||
+            recover_set_active(h.from_role, h.from_id, h.username, 1, 1) != 0) {
+            printf("Recovery: role change #%d for %s could not be rolled back; left PENDING for "
+                   "manual review.\n", h.id, h.username);
+            problems++;
+            continue;
+        }
+        if (log_set_status(hfd, r, ROLE_HIST_RECORD_SIZE, TXN_STATUS_VOID) != 0) {
+            problems++;
+            continue;
+        }
+
+        printf("Recovery: role change #%d for %s (role %d id %d -> role %d id %d) rolled back.\n",
+               h.id, h.username, h.from_role, h.from_id, h.to_role, h.to_id);
+        fixed++;
+    }
+
+    if (fixed || problems)
+        printf("Recovery: %d role change(s) resolved, %d need manual review.\n", fixed, problems);
+
+    close(hfd);
+    return problems;
 }

@@ -37,4 +37,5 @@ int is_valid_password(const char *s);    /* 6-20 printable chars, no spaces or c
 
 int log_set_status(int fd, long row_no, int row_size, char status);   /* rewrite one row's status byte */
 
+void crash_point(const char *name);   /* test hook: dies here if BMS_CRASH_POINT == name */
 #endif

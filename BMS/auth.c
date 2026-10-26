@@ -287,3 +287,13 @@ void auth_prompt_change_password(int fd, const Session *s) {
                          "Your password was not changed.\n");
     }
 }
+
+/* Test hook: if the environment variable BMS_CRASH_POINT equals name, die immediately, like a power
+   cut for this process. No cleanup, no unlock, no logout. Does nothing in normal runs. */
+void crash_point(const char *name) {
+    const char *p = getenv("BMS_CRASH_POINT");
+    if (p && strcmp(p, name) == 0) {
+        fprintf(stderr, "*** simulated crash at '%s' (pid %d) ***\n", name, (int)getpid());
+        _exit(1);
+    }
+}
