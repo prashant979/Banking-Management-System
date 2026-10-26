@@ -14,14 +14,6 @@ typedef enum {
     TXN_IO_ERROR
 } TxnStatus;
 
-typedef enum {
-    PW_OK = 0,
-    PW_WRONG_OLD,
-    PW_INVALID_NEW,
-    PW_SAME_AS_OLD,
-    PW_ERROR
-} PasswordStatus;
-
 /* --- record store: fixed-width rows, one fcntl byte-range lock per customer --- */
 int customer_validate_file(void);                      /* startup check; creates the file if missing */
 int customer_open(void);                               /* fd (open once per request, keep it) or -1 */

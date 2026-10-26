@@ -228,3 +228,57 @@ int auth_reset_sessions(void) {
     if (reset_staff(ROLE_EMPLOYEE) != 0) rc = -1;
     return rc;
 }
+/* Shared change-password screen. The session decides whose password changes and which
+   store is used, so the client can never name another account. */
+void auth_prompt_change_password(int fd, const Session *s) {
+    char old_pw[BUFFER_SIZE], new1[BUFFER_SIZE], new2[BUFFER_SIZE], msg[BUFFER_SIZE];
+    PasswordStatus st;
+
+    if (!s->logged_in) {
+        send_message(fd, "Access denied.\n");
+        return;
+    }
+
+    if (prompt_input(fd, "Enter current password: ", old_pw, sizeof(old_pw)) <= 0) return;
+    if (prompt_input(fd, "Enter new password: ", new1, sizeof(new1)) <= 0) return;
+    if (prompt_input(fd, "Confirm new password: ", new2, sizeof(new2)) <= 0) return;
+
+    if (strcmp(new1, new2) != 0) {
+        send_message(fd, "Passwords do not match. Password not changed.\n");
+        return;
+    }
+
+    switch (s->role) {
+    case ROLE_CUSTOMER:
+        st = customer_change_password(s->user_id, old_pw, new1);
+        break;
+    case ROLE_EMPLOYEE:
+    case ROLE_MANAGER:
+    case ROLE_ADMIN:
+        st = staff_change_password(s->role, s->user_id, old_pw, new1);
+        break;
+    default:
+        st = PW_ERROR;
+    }
+
+    switch (st) {
+    case PW_OK:
+        send_message(fd, "Password changed successfully.\n");
+        break;
+    case PW_WRONG_OLD:
+        send_message(fd, "Current password is incorrect. Password not changed.\n");
+        break;
+    case PW_INVALID_NEW:
+        snprintf(msg, sizeof(msg),
+                 "New password must be %d-%d characters with no spaces or commas.\n",
+                 MIN_PASSWORD_LEN, MAX_PASSWORD_LEN);
+        send_message(fd, msg);
+        break;
+    case PW_SAME_AS_OLD:
+        send_message(fd, "New password must be different from the current one.\n");
+        break;
+    default:
+        send_message(fd, "Could not change the password due to a server error. "
+                         "Your password was not changed.\n");
+    }
+}

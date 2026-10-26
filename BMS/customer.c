@@ -474,16 +474,6 @@ int customer_validate_logs(void) {
     return log_validate_file(FEEDBACK_FILE, FEEDBACK_RECORD_SIZE, hdr);
 }
 
-/* 6-49 printable ASCII characters, no spaces, no commas (a comma would break the CSV row). */
-static int password_policy_ok(const char *pw) {
-    size_t len = strlen(pw);
-    if (len < MIN_PASSWORD_LEN || len > MAX_PASSWORD_LEN) return -1;
-    for (size_t i = 0; i < len; i++) {
-        unsigned char c = (unsigned char)pw[i];
-        if (c <= 32 || c >= 127 || c == ',') return -1;
-    }
-    return 0;
-}
 
 /* Verifies the old password and saves the new one under an EXCLUSIVE lock on this
    customer's record only. A failed write restores the previous row. */

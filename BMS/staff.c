@@ -152,3 +152,40 @@ int staff_validate_file(int role) {
     close(fd);
     return rc;
 }
+
+/* Verifies the old password and saves the new one under an EXCLUSIVE lock on this staff
+   member's record only. A failed write restores the previous row. Works for any staff file. */
+PasswordStatus staff_change_password(int role, int user_id, const char *old_pw, const char *new_pw) {
+    if (password_policy_ok(new_pw) != 0) return PW_INVALID_NEW;
+
+    int fd = staff_open(role);
+    if (fd < 0) return PW_ERROR;
+
+    int idx = staff_find_by_id(fd, user_id);              /* lock-free locate */
+    if (idx < 0) { close(fd); return PW_ERROR; }
+
+    PasswordStatus st = PW_ERROR;
+    if (staff_lock(fd, idx, F_WRLCK) == 0) {
+        Staff m;
+        if (staff_read_record(fd, idx, &m) == 0 && m.id == user_id) {   /* re-check under lock */
+            if (strcmp(m.password, old_pw) != 0) {
+                st = PW_WRONG_OLD;
+            } else if (strcmp(old_pw, new_pw) == 0) {
+                st = PW_SAME_AS_OLD;
+            } else {
+                Staff before = m;                         /* before-image for undo */
+                memset(m.password, 0, sizeof(m.password));
+                strncpy(m.password, new_pw, sizeof(m.password) - 1);
+                if (staff_write_record(fd, idx, &m) == 0) {
+                    st = PW_OK;
+                } else {
+                    staff_write_record(fd, idx, &before); /* fallback: old password stays */
+                    st = PW_ERROR;
+                }
+            }
+        }
+        staff_unlock(fd, idx);
+    }
+    close(fd);                                            /* close only after unlocking */
+    return st;
+}
