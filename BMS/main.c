@@ -37,3 +37,12 @@ NR>1 { split($0,f,","); if (f[1]+0==0) next; msg=$0; sub(/^[^,]*,[^,]*,[^,]*,/,"
 wc -c manager.csv                    # must print 285 (95 x 3 rows)
 awk 'length($0)!=94' manager.csv     # must print nothing
 */
+
+/*
+[ -f admin.csv ] && cp admin.csv admin.csv.bak
+{ printf '%-6s,%-20s,%-20s,%-20s,%-20s,%s,%s\n' id firstname lastname username password a l
+  printf '%-6d,%-20s,%-20s,%-20s,%-20s,%d,%d\n' 4001 Admin User admin admin123 1 0
+} > admin.csv
+wc -c admin.csv                    # must be 190 (95 x 2 rows)
+awk 'length($0)!=94' admin.csv     # prints nothing
+*/

@@ -129,7 +129,8 @@ AuthStatus auth_login(int role, const char *username, const char *password, Sess
     switch (role) {
     case ROLE_CUSTOMER: return login_customer(username, password, s);
     case ROLE_EMPLOYEE:
-    case ROLE_MANAGER:  return login_staff(role, username, password, s);
+    case ROLE_MANAGER: 
+    case ROLE_ADMIN:  return login_staff(role, username, password, s);
     default:            return AUTH_ROLE_UNSUPPORTED;
     }
 }
@@ -228,6 +229,7 @@ int auth_reset_sessions(void) {
     int rc = reset_customers();
     if (reset_staff(ROLE_EMPLOYEE) != 0) rc = -1;
     if (reset_staff(ROLE_MANAGER)  != 0) rc = -1;
+    if (reset_staff(ROLE_ADMIN) != 0) rc = -1;
     return rc;
 }
 

@@ -15,6 +15,7 @@
 #include "staff.h"
 #include "employee.h"
 #include "manager.h"
+#include "admin.h"
 /* Reap finished children so they don't become zombies. */
 static void sigchld_handler(int sig) {
     (void)sig;
@@ -54,18 +55,14 @@ static void handle_client(int client_fd) {
             continue;
         }
 
-        if (choice != ROLE_CUSTOMER && choice != ROLE_EMPLOYEE && choice != ROLE_MANAGER) {
-            send_message(client_fd, "This role will be implemented in a later step.\n");
-            continue;
-        }
-
         int r = auth_prompt_login(client_fd, choice, &session);
         if (r == LOGIN_DISCONNECTED) break;
         if (r == LOGIN_OK) {
             switch (choice) {
-            case ROLE_CUSTOMER: customer_menu(client_fd, &session); break;
-            case ROLE_EMPLOYEE: employee_menu(client_fd, &session); break;
-            case ROLE_MANAGER:  manager_menu(client_fd, &session);  break;
+                case ROLE_CUSTOMER: customer_menu(client_fd, &session); break;
+                case ROLE_EMPLOYEE: employee_menu(client_fd, &session); break;
+                case ROLE_MANAGER:  manager_menu(client_fd, &session);  break;
+                case ROLE_ADMIN: admin_menu(client_fd, &session); break;
             }
             auth_logout(&session);       /* always release the session, even if client dropped */
         }
@@ -127,6 +124,11 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 
+    if (staff_validate_file(ROLE_ADMIN) != 0) {
+        fprintf(stderr, "%s is not in the fixed-width format (%d bytes per row). "
+                        "Recreate it, then restart.\n", ADMIN_FILE, STAFF_RECORD_SIZE);
+        exit(EXIT_FAILURE);
+    }
     if (customer_validate_logs() != 0) {
         fprintf(stderr, "%s or %s is not in the fixed-width log format. "
                         "Move the old files aside and restart.\n", TXN_FILE, FEEDBACK_FILE);
