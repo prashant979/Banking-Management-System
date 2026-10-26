@@ -8,6 +8,7 @@
 #include "staff.h"
 #include <time.h>
 #include "role.h"
+#include "employee.h"
 
 #define ROLE_HISTORY_MAX 50
 
@@ -72,6 +73,116 @@ static const char *role_name(int role) {
     case ROLE_MANAGER:  return "Manager";
     case ROLE_ADMIN:    return "Administrator";
     default:            return "Customer";
+    }
+}
+
+static void modify_staff_screen(int fd, int role) {
+    char buf[BUFFER_SIZE], first[BUFFER_SIZE], last[BUFFER_SIZE], user[BUFFER_SIZE];
+    char prompt[128], msg[BUFFER_SIZE];
+    int id, active_change = -1, conflict = 0;
+    Staff s;
+
+    if (prompt_input(fd, "Account ID: ", buf, sizeof(buf)) <= 0) return;
+    if (parse_id(buf, &id) != 0) {
+        send_message(fd, "Invalid account ID.\n");
+        return;
+    }
+    if (staff_get_details(role, id, &s) != 0) {
+        snprintf(msg, sizeof(msg), "%s not found.\n", role_name(role));
+        send_message(fd, msg);
+        return;
+    }
+
+    snprintf(msg, sizeof(msg),
+             "\nCurrent details (%s)\n"
+             "ID         : %d\n"
+             "First name : %.20s\n"
+             "Last name  : %.20s\n"
+             "Username   : %.20s\n"
+             "Status     : %s%s\n"
+             "Press Enter to keep a value unchanged.\n",
+             role_name(role), s.id, s.firstname, s.lastname, s.username,
+             s.active ? "Active" : "Deactivated", s.logged_in ? " (logged in now)" : "");
+    send_message(fd, msg);
+
+    snprintf(prompt, sizeof(prompt), "New first name [%.20s]: ", s.firstname);
+    if (prompt_input(fd, prompt, first, sizeof(first)) <= 0) return;
+    snprintf(prompt, sizeof(prompt), "New last name [%.20s]: ", s.lastname);
+    if (prompt_input(fd, prompt, last, sizeof(last)) <= 0) return;
+    snprintf(prompt, sizeof(prompt), "New username [%.20s]: ", s.username);
+    if (prompt_input(fd, prompt, user, sizeof(user)) <= 0) return;
+
+    snprintf(prompt, sizeof(prompt),
+             "Status [%s]: 1 = keep, 2 = activate, 3 = deactivate: ",
+             s.active ? "Active" : "Deactivated");
+    if (prompt_input(fd, prompt, buf, sizeof(buf)) <= 0) return;
+    if (buf[0] == '\0' || strcmp(buf, "1") == 0) active_change = -1;
+    else if (strcmp(buf, "2") == 0)              active_change = 1;
+    else if (strcmp(buf, "3") == 0)              active_change = 0;
+    else {
+        send_message(fd, "Invalid status choice. Nothing was changed.\n");
+        return;
+    }
+
+    switch (staff_modify(role, id, first, last, user, active_change, &conflict)) {
+    case SM_OK:
+        snprintf(msg, sizeof(msg), "%s %d updated successfully.\n", role_name(role), id);
+        send_message(fd, msg);
+        break;
+    case SM_NO_CHANGE:
+        send_message(fd, "No changes made.\n");
+        break;
+    case SM_NOT_FOUND:
+        send_message(fd, "Account not found. Nothing was changed.\n");
+        break;
+    case SM_BAD_FIRSTNAME:
+    case SM_BAD_LASTNAME:
+        snprintf(msg, sizeof(msg), "Names must be 1-%d letters (A-Z, a-z) only. Nothing was changed.\n",
+                 CUSTOMER_FIELD_LEN);
+        send_message(fd, msg);
+        break;
+    case SM_BAD_USERNAME:
+        snprintf(msg, sizeof(msg),
+                 "Username must be 3-%d characters: lowercase letters, digits or underscore. "
+                 "Nothing was changed.\n", CUSTOMER_FIELD_LEN);
+        send_message(fd, msg);
+        break;
+    case SM_USERNAME_TAKEN:
+        send_message(fd, "That username is already used by another employee or manager "
+                         "(active or deactivated). Nothing was changed.\n");
+        break;
+    case SM_LOGGED_IN:
+        send_message(fd, "This user is logged in right now. Ask them to log out before "
+                         "deactivating the account. Nothing was changed.\n");
+        break;
+    case SM_ACTIVE_IN_OTHER_ROLE:
+        snprintf(msg, sizeof(msg),
+                 "This person is already active as %s (ID %d). Use Manage User Roles -> Change Role "
+                 "instead. Nothing was changed.\n",
+                 role_name(role == ROLE_EMPLOYEE ? ROLE_MANAGER : ROLE_EMPLOYEE), conflict);
+        send_message(fd, msg);
+        break;
+    default:
+        send_message(fd, "Could not update the account due to a server error. Nothing was changed.\n");
+    }
+}
+
+static void do_modify_details(int fd, const Session *session) {
+    char buf[BUFFER_SIZE];
+
+    if (!auth_require_role(session, ROLE_ADMIN)) {           /* role check on the action itself */
+        send_message(fd, "Access denied.\n");
+        return;
+    }
+
+    if (prompt_input(fd, "\nAccount type (1 = Customer, 2 = Employee, 3 = Manager): ",
+                     buf, sizeof(buf)) <= 0) return;
+
+    switch (atoi(buf)) {
+    case 1: modify_customer_screen(fd);               break;
+    case 2: modify_staff_screen(fd, ROLE_EMPLOYEE);   break;
+    case 3: modify_staff_screen(fd, ROLE_MANAGER);    break;
+    default: send_message(fd, "Invalid account type.\n");
     }
 }
 
@@ -241,7 +352,7 @@ int admin_menu(int fd, Session *session) {
             do_add_staff(fd, session, ROLE_EMPLOYEE);
             break;
         case 3:
-            send_message(fd, "This feature will be implemented in a later step.\n");
+            do_modify_details(fd, session);    
             break;
         case 4:
             manage_roles_menu(fd, session);

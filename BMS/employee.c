@@ -75,23 +75,19 @@ static int read_account_id(const char *s, int *out) {      /* digits only, 1-9 c
     return 0;
 }
 
-static void do_modify_customer(int fd, const Session *session) {
+/* Shared customer edit screen (used by Employee and Administrator). No role check here:
+   each caller verifies its own role first. */
+void modify_customer_screen(int fd) {
     char buf[BUFFER_SIZE], first[BUFFER_SIZE], last[BUFFER_SIZE];
     char prompt[128], msg[BUFFER_SIZE];
     int id;
     Customer c;
-
-    if (!auth_require_role(session, ROLE_EMPLOYEE)) {      /* role check on the action itself */
-        send_message(fd, "Access denied.\n");
-        return;
-    }
 
     if (prompt_input(fd, "Enter customer account ID: ", buf, sizeof(buf)) <= 0) return;
     if (read_account_id(buf, &id) != 0) {
         send_message(fd, "Invalid account ID.\n");
         return;
     }
-
     if (customer_get_details(id, &c) != 0) {
         send_message(fd, "Customer not found.\n");
         return;
@@ -102,7 +98,7 @@ static void do_modify_customer(int fd, const Session *session) {
              "Account ID : %d\n"
              "First name : %.20s\n"
              "Last name  : %.20s\n"
-             "Username   : %.20s  (cannot be changed)\n"
+             "Username   : %.20s\n"
              "Status     : %s\n"
              "Press Enter to keep a value unchanged.\n",
              c.id, c.firstname, c.lastname, c.username,
@@ -127,14 +123,21 @@ static void do_modify_customer(int fd, const Session *session) {
         break;
     case MOD_BAD_FIRSTNAME:
     case MOD_BAD_LASTNAME:
-        snprintf(msg, sizeof(msg),
-                 "Names must be 1-%d letters (A-Z, a-z) only. Nothing was changed.\n",
+        snprintf(msg, sizeof(msg), "Names must be 1-%d letters (A-Z, a-z) only. Nothing was changed.\n",
                  CUSTOMER_FIELD_LEN);
         send_message(fd, msg);
         break;
     default:
         send_message(fd, "Could not update the customer due to a server error. Nothing was changed.\n");
     }
+}
+
+static void do_modify_customer(int fd, const Session *session) {
+    if (!auth_require_role(session, ROLE_EMPLOYEE)) {      /* role check on the action itself */
+        send_message(fd, "Access denied.\n");
+        return;
+    }
+    modify_customer_screen(fd);
 }
 
 static void do_view_customer_transactions(int fd, const Session *session) {
