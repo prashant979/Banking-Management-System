@@ -199,70 +199,91 @@ static int staff_id_base(int role) {
     }
 }
 
-/* Guard (byte 0) serialises adds to this file; the username check and the append happen
-   under it. Logins and other staff operations lock rows only, so they never wait for it. */
+/* Scans every row (active or not) for username, skipping row skip_idx. Each row is read under a
+   brief SHARED lock. Returns 1 if found (fills *found_active / *found_id if not NULL), 0 if not,
+   -1 on error. Callers hold the guards, so usernames cannot change during the scan. */
+static int staff_scan_username(int fd, const char *username, int skip_idx,
+                               int *found_active, int *found_id) {
+    int n = staff_count(fd);
+    if (n < 0) return -1;
+
+    for (int i = 0; i < n; i++) {
+        Staff s;
+        int match = 0;
+        if (i == skip_idx) continue;
+        if (staff_lock(fd, i, F_RDLCK) < 0) return -1;
+        if (staff_read_record(fd, i, &s) == 0 && strcmp(s.username, username) == 0) match = 1;
+        staff_unlock(fd, i);
+        if (match) {
+            if (found_active) *found_active = s.active;
+            if (found_id)     *found_id = s.id;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Employees and managers: both guards (employee first, the global staff order), username checked
+   in BOTH files, then the row is appended to the role's own file. Admins use only admin.csv. */
 StaffAddStatus staff_add(int role, const char *firstname, const char *lastname,
                          const char *username, const char *password, int *new_id) {
     StaffAddStatus status = STAFF_ADD_IO_ERROR;
-    int guard = 0, row_locked = 0, n, i;
-    off_t off = 0;
-    Staff s, other;
-    char row[STAFF_RECORD_SIZE + 1];
+    int efd = -1, mfd = -1, afd = -1, fd = -1;
+    int eg = 0, mg = 0, ag = 0, idx = -1, row_locked = 0, r = -1;
+    Staff s;
 
-    int base = staff_id_base(role);
-    if (base < 0)                      return STAFF_ADD_BAD_ROLE;
+    if (staff_id_base(role) < 0)       return STAFF_ADD_BAD_ROLE;
     if (!is_valid_name(firstname))     return STAFF_ADD_BAD_FIRSTNAME;
     if (!is_valid_name(lastname))      return STAFF_ADD_BAD_LASTNAME;
     if (!is_valid_username(username))  return STAFF_ADD_BAD_USERNAME;
     if (!is_valid_password(password))  return STAFF_ADD_BAD_PASSWORD;
 
-    int fd = staff_open(role);
-    if (fd < 0) return STAFF_ADD_IO_ERROR;
-
-    if (lock_record(fd, F_WRLCK, 0, 1) < 0) goto done;       /* guard: one add at a time */
-    guard = 1;
-
-    n = staff_count(fd);                                     /* stable while we hold the guard */
-    if (n < 0) goto done;
-
-    for (i = 0; i < n; i++) {                                /* username must be unused */
-        int taken = 0;
-        if (staff_lock(fd, i, F_RDLCK) < 0) goto done;
-        if (staff_read_record(fd, i, &other) == 0 && strcmp(other.username, username) == 0)
-            taken = 1;
-        staff_unlock(fd, i);
-        if (taken) { status = STAFF_ADD_USERNAME_TAKEN; goto done; }
+    if (role == ROLE_ADMIN) {
+        afd = staff_open(ROLE_ADMIN);
+        if (afd < 0) goto done;
+        if (staff_lock_guard(afd) < 0) goto done;
+        ag = 1;
+        fd = afd;
+        r = staff_scan_username(afd, username, -1, NULL, NULL);
+    } else {
+        efd = staff_open(ROLE_EMPLOYEE);
+        mfd = staff_open(ROLE_MANAGER);
+        if (efd < 0 || mfd < 0) goto done;
+        if (staff_lock_guard(efd) < 0) goto done;            /* always employee first */
+        eg = 1;
+        if (staff_lock_guard(mfd) < 0) goto done;
+        mg = 1;
+        fd = (role == ROLE_EMPLOYEE) ? efd : mfd;
+        r = staff_scan_username(efd, username, -1, NULL, NULL);
+        if (r == 0) r = staff_scan_username(mfd, username, -1, NULL, NULL);
     }
+    if (r < 0) goto done;
+    if (r == 1) { status = STAFF_ADD_USERNAME_TAKEN; goto done; }
 
     memset(&s, 0, sizeof(s));
-    s.id        = base + n + 1;                              /* row number n + 1 */
     s.active    = 1;
     s.logged_in = 0;
     strncpy(s.firstname, firstname, sizeof(s.firstname) - 1);
     strncpy(s.lastname,  lastname,  sizeof(s.lastname)  - 1);
     strncpy(s.username,  username,  sizeof(s.username)  - 1);
     strncpy(s.password,  password,  sizeof(s.password)  - 1);
-    if (record_format(&s, row) != 0) goto done;
 
-    off = record_offset(n);                                  /* = current end of file */
-    if (lock_record(fd, F_WRLCK, off, STAFF_RECORD_SIZE) < 0) goto done;
+    if (staff_append_locked(fd, role, &s, &idx) != 0) goto done;   /* new row stays locked */
     row_locked = 1;
-
-    if (pwrite(fd, row, STAFF_RECORD_SIZE, off) != STAFF_RECORD_SIZE || fsync(fd) != 0) {
-        if (ftruncate(fd, off) == 0) fsync(fd);              /* fallback: remove the new row */
-        goto done;
-    }
 
     *new_id = s.id;
     status = STAFF_ADD_OK;
 
 done:
-    if (row_locked) unlock_record(fd, off, STAFF_RECORD_SIZE);
-    if (guard)      unlock_record(fd, 0, 1);
-    close(fd);
+    if (row_locked) staff_unlock(fd, idx);                   /* release in reverse order */
+    if (mg) staff_unlock_guard(mfd);
+    if (eg) staff_unlock_guard(efd);
+    if (ag) staff_unlock_guard(afd);
+    if (afd >= 0) close(afd);
+    if (mfd >= 0) close(mfd);
+    if (efd >= 0) close(efd);
     return status;
 }
-
 int staff_get_details(int role, int id, Staff *out) {
     int fd = staff_open(role);
     if (fd < 0) return -1;
@@ -310,4 +331,110 @@ int staff_append_locked(int fd, int role, Staff *s, int *idx_out) {
 int staff_truncate_locked(int fd, int idx) {
     if (ftruncate(fd, record_offset(idx)) != 0) return -1;
     return (fsync(fd) == 0) ? 0 : -1;
+}
+
+StaffModStatus staff_modify(int role, int id, const char *firstname, const char *lastname,
+                            const char *username, int active_change, int *conflict_id) {
+    StaffModStatus st = SM_IO_ERROR;
+    int efd = -1, mfd = -1, fd = -1, ofd = -1, eg = 0, mg = 0;
+    int idx = -1, locked = 0, r, found_active = 0, found_id = 0;
+    int chg_first = (firstname && *firstname);
+    int chg_last  = (lastname  && *lastname);
+    int chg_user  = (username  && *username);
+    Staff s, before, cur;
+
+    if (role != ROLE_EMPLOYEE && role != ROLE_MANAGER) return SM_BAD_ROLE;
+    if (chg_first && !is_valid_name(firstname))    return SM_BAD_FIRSTNAME;
+    if (chg_last  && !is_valid_name(lastname))     return SM_BAD_LASTNAME;
+    if (chg_user  && !is_valid_username(username)) return SM_BAD_USERNAME;
+    if (!chg_first && !chg_last && !chg_user && active_change < 0) return SM_NO_CHANGE;
+
+    efd = staff_open(ROLE_EMPLOYEE);
+    mfd = staff_open(ROLE_MANAGER);
+    if (efd < 0 || mfd < 0) goto done;
+
+    /* 1. both guards, employee first (same order as add and role change) */
+    if (staff_lock_guard(efd) < 0) goto done;
+    eg = 1;
+    if (staff_lock_guard(mfd) < 0) goto done;
+    mg = 1;
+
+    fd  = (role == ROLE_EMPLOYEE) ? efd : mfd;               /* this person's file */
+    ofd = (role == ROLE_EMPLOYEE) ? mfd : efd;               /* the other staff file */
+
+    idx = staff_find_by_id(fd, id);                          /* lock-free locate */
+    if (idx == -2) goto done;
+    if (idx < 0) { st = SM_NOT_FOUND; goto done; }
+
+    /* 2. current values. Usernames and 'active' only change under both guards, which we hold. */
+    if (staff_lock(fd, idx, F_RDLCK) < 0) goto done;
+    r = staff_read_record(fd, idx, &cur);
+    staff_unlock(fd, idx);
+    if (r != 0 || cur.id != id) goto done;
+
+    /* 3. new username must be unused in BOTH files (active or deactivated), except this row */
+    if (chg_user && strcmp(username, cur.username) != 0) {
+        r = staff_scan_username(fd, username, idx, NULL, NULL);
+        if (r == 0) r = staff_scan_username(ofd, username, -1, NULL, NULL);
+        if (r < 0) goto done;
+        if (r == 1) { st = SM_USERNAME_TAKEN; goto done; }
+    }
+
+    /* 4. activating: the same person must not already be active in the other role */
+    if (active_change == 1 && !cur.active) {
+        r = staff_scan_username(ofd, cur.username, -1, &found_active, &found_id);
+        if (r < 0) goto done;
+        if (r == 1 && found_active) {
+            if (conflict_id) *conflict_id = found_id;
+            st = SM_ACTIVE_IN_OTHER_ROLE;
+            goto done;
+        }
+    }
+
+    /* 5. exclusive lock on the row, LAST, so we never hold a row while waiting for another */
+    if (staff_lock(fd, idx, F_WRLCK) < 0) goto done;
+    locked = 1;
+    if (staff_read_record(fd, idx, &s) != 0 || s.id != id) goto done;
+
+    if (active_change == 0 && s.active && s.logged_in) {     /* logged_in can change: re-check */
+        st = SM_LOGGED_IN;
+        goto done;
+    }
+    before = s;                                              /* before-image for undo */
+
+    if (chg_first) {
+        memset(s.firstname, 0, sizeof(s.firstname));
+        strncpy(s.firstname, firstname, sizeof(s.firstname) - 1);
+    }
+    if (chg_last) {
+        memset(s.lastname, 0, sizeof(s.lastname));
+        strncpy(s.lastname, lastname, sizeof(s.lastname) - 1);
+    }
+    if (chg_user) {
+        memset(s.username, 0, sizeof(s.username));
+        strncpy(s.username, username, sizeof(s.username) - 1);
+    }
+    if (active_change >= 0) s.active = active_change;
+
+    if (strcmp(s.firstname, before.firstname) == 0 &&
+        strcmp(s.lastname,  before.lastname)  == 0 &&
+        strcmp(s.username,  before.username)  == 0 &&
+        s.active == before.active) {
+        st = SM_NO_CHANGE;
+        goto done;
+    }
+
+    if (staff_write_record(fd, idx, &s) != 0) {              /* 6. write in place + fsync */
+        staff_write_record(fd, idx, &before);                /* fallback: restore old row */
+        goto done;
+    }
+    st = SM_OK;
+
+done:
+    if (locked) staff_unlock(fd, idx);                       /* release in reverse order */
+    if (mg) staff_unlock_guard(mfd);
+    if (eg) staff_unlock_guard(efd);
+    if (mfd >= 0) close(mfd);
+    if (efd >= 0) close(efd);
+    return st;
 }

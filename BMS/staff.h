@@ -40,4 +40,22 @@ int staff_append_locked(int fd, int role, Staff *s, int *idx_out);
 /* Caller holds the guard and idx is the last row: removes it again. */
 int staff_truncate_locked(int fd, int idx);
 
+typedef enum {
+    SM_OK = 0,
+    SM_NOT_FOUND,
+    SM_BAD_FIRSTNAME,
+    SM_BAD_LASTNAME,
+    SM_BAD_USERNAME,
+    SM_USERNAME_TAKEN,
+    SM_LOGGED_IN,
+    SM_ACTIVE_IN_OTHER_ROLE,
+    SM_NO_CHANGE,
+    SM_BAD_ROLE,
+    SM_IO_ERROR
+} StaffModStatus;
+
+/* Employee or manager. "" = keep a field. active_change: -1 keep, 0 deactivate, 1 activate.
+   On SM_ACTIVE_IN_OTHER_ROLE, *conflict_id is the person's active account in the other role. */
+StaffModStatus staff_modify(int role, int id, const char *firstname, const char *lastname,
+                            const char *username, int active_change, int *conflict_id);
 #endif
