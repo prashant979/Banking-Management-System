@@ -262,3 +262,52 @@ done:
     close(fd);
     return status;
 }
+
+int staff_get_details(int role, int id, Staff *out) {
+    int fd = staff_open(role);
+    if (fd < 0) return -1;
+
+    int idx = staff_find_by_id(fd, id);                     /* lock-free locate */
+    if (idx < 0) { close(fd); return -1; }
+
+    int rc = -1;
+    if (staff_lock(fd, idx, F_RDLCK) == 0) {
+        Staff s;
+        if (staff_read_record(fd, idx, &s) == 0 && s.id == id) {   /* re-check under lock */
+            memset(s.password, 0, sizeof(s.password));
+            *out = s;
+            rc = 0;
+        }
+        staff_unlock(fd, idx);
+    }
+    close(fd);
+    return rc;
+}
+
+int staff_lock_guard(int fd)   { return lock_record(fd, F_WRLCK, 0, 1); }
+int staff_unlock_guard(int fd) { return unlock_record(fd, 0, 1); }
+
+int staff_append_locked(int fd, int role, Staff *s, int *idx_out) {
+    char row[STAFF_RECORD_SIZE + 1];
+    int base = staff_id_base(role);
+    int n = staff_count(fd);
+    if (base < 0 || n < 0) return -1;
+
+    s->id = base + n + 1;
+    if (record_format(s, row) != 0) return -1;
+
+    off_t off = record_offset(n);
+    if (lock_record(fd, F_WRLCK, off, STAFF_RECORD_SIZE) < 0) return -1;
+    if (pwrite(fd, row, STAFF_RECORD_SIZE, off) != STAFF_RECORD_SIZE || fsync(fd) != 0) {
+        if (ftruncate(fd, off) == 0) fsync(fd);
+        unlock_record(fd, off, STAFF_RECORD_SIZE);
+        return -1;
+    }
+    *idx_out = n;                                           /* row stays locked for the caller */
+    return 0;
+}
+
+int staff_truncate_locked(int fd, int idx) {
+    if (ftruncate(fd, record_offset(idx)) != 0) return -1;
+    return (fsync(fd) == 0) ? 0 : -1;
+}

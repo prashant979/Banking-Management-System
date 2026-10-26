@@ -35,4 +35,6 @@ int is_valid_name(const char *s);        /* letters only, 1-20 */
 int is_valid_username(const char *s);    /* a-z, 0-9, '_', 3-20 */
 int is_valid_password(const char *s);    /* 6-20 printable chars, no spaces or commas */
 
+int log_set_status(int fd, long row_no, int row_size, char status);   /* rewrite one row's status byte */
+
 #endif

@@ -32,4 +32,12 @@ typedef enum {
 StaffAddStatus staff_add(int role, const char *firstname, const char *lastname,
                          const char *username, const char *password, int *new_id);
    
+int staff_get_details(int role, int id, Staff *out);       /* shared-lock read; password blanked */
+int staff_lock_guard(int fd);                              /* byte 0 of the file */
+int staff_unlock_guard(int fd);
+/* Caller holds the guard. Appends *s (sets s->id); the new row is left EXCLUSIVELY locked. */
+int staff_append_locked(int fd, int role, Staff *s, int *idx_out);
+/* Caller holds the guard and idx is the last row: removes it again. */
+int staff_truncate_locked(int fd, int idx);
+
 #endif

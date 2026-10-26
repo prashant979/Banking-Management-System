@@ -16,6 +16,7 @@
 #include "employee.h"
 #include "manager.h"
 #include "admin.h"
+#include "role.h"
 /* Reap finished children so they don't become zombies. */
 static void sigchld_handler(int sig) {
     (void)sig;
@@ -134,6 +135,12 @@ int main(void) {
                         "Move the old files aside and restart.\n", TXN_FILE, FEEDBACK_FILE);
         exit(EXIT_FAILURE);
     }
+    if (role_validate_history() != 0) {
+        fprintf(stderr, "%s is not in the fixed-width format (%d bytes per row).\n",
+                ROLE_HIST_FILE, ROLE_HIST_RECORD_SIZE);
+        exit(EXIT_FAILURE);
+    }
+
 
     if (auth_reset_sessions() != 0) {
     	fprintf(stderr, "Warning: could not reset sessions in %s\n", CUSTOMER_FILE);
