@@ -128,7 +128,8 @@ static void logout_staff(int role, int user_id) {
 AuthStatus auth_login(int role, const char *username, const char *password, Session *s) {
     switch (role) {
     case ROLE_CUSTOMER: return login_customer(username, password, s);
-    case ROLE_EMPLOYEE: return login_staff(role, username, password, s);
+    case ROLE_EMPLOYEE:
+    case ROLE_MANAGER:  return login_staff(role, username, password, s);
     default:            return AUTH_ROLE_UNSUPPORTED;
     }
 }
@@ -226,8 +227,10 @@ static int reset_staff(int role) {
 int auth_reset_sessions(void) {
     int rc = reset_customers();
     if (reset_staff(ROLE_EMPLOYEE) != 0) rc = -1;
+    if (reset_staff(ROLE_MANAGER)  != 0) rc = -1;
     return rc;
 }
+
 /* Shared change-password screen. The session decides whose password changes and which
    store is used, so the client can never name another account. */
 void auth_prompt_change_password(int fd, const Session *s) {
