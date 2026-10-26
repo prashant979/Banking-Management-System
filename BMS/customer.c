@@ -602,6 +602,80 @@ done:
     return status;
 }
 
+/* Reads one customer under a SHARED lock on that row only. The password is never returned. */
+int customer_get_details(int id, Customer *out) {
+    int fd = customer_open();
+    if (fd < 0) return -1;
+
+    int idx = customer_find_by_id(fd, id);                 /* lock-free locate */
+    if (idx < 0) { close(fd); return -1; }
+
+    int rc = -1;
+    if (customer_lock(fd, idx, F_RDLCK) == 0) {
+        Customer c;
+        if (customer_read_record(fd, idx, &c) == 0 && c.id == id) {   /* re-check under lock */
+            memset(c.password, 0, sizeof(c.password));
+            *out = c;
+            rc = 0;
+        }
+        customer_unlock(fd, idx);
+    }
+    close(fd);                                             /* close only after unlocking */
+    return rc;
+}
+
+/* Changes the first and/or last name of one customer (the username is never changed).
+   Locks exactly ONE row: exclusive, read again after locking, only the edited fields applied. */
+ModStatus customer_modify(int id, const char *firstname, const char *lastname) {
+    ModStatus status = MOD_IO_ERROR;
+    int locked = 0, idx;
+    int chg_first = (firstname && *firstname);
+    int chg_last  = (lastname  && *lastname);
+    Customer c, before;
+
+    if (chg_first && !valid_name(firstname)) return MOD_BAD_FIRSTNAME;
+    if (chg_last  && !valid_name(lastname))  return MOD_BAD_LASTNAME;
+    if (!chg_first && !chg_last)             return MOD_NO_CHANGE;
+
+    int fd = customer_open();
+    if (fd < 0) return MOD_IO_ERROR;
+
+    idx = customer_find_by_id(fd, id);                       /* lock-free locate */
+    if (idx == -2) goto done;
+    if (idx < 0)   { status = MOD_NOT_FOUND; goto done; }
+
+    if (customer_lock(fd, idx, F_WRLCK) < 0) goto done;      /* exclusive lock on ONE row */
+    locked = 1;
+
+    if (customer_read_record(fd, idx, &c) != 0 || c.id != id) goto done;
+    before = c;                                              /* before-image for undo */
+
+    if (chg_first) {
+        memset(c.firstname, 0, sizeof(c.firstname));
+        strncpy(c.firstname, firstname, sizeof(c.firstname) - 1);
+    }
+    if (chg_last) {
+        memset(c.lastname, 0, sizeof(c.lastname));
+        strncpy(c.lastname, lastname, sizeof(c.lastname) - 1);
+    }
+
+    if (strcmp(c.firstname, before.firstname) == 0 &&
+        strcmp(c.lastname,  before.lastname)  == 0) {
+        status = MOD_NO_CHANGE;                              /* same values typed again */
+        goto done;
+    }
+
+    if (customer_write_record(fd, idx, &c) != 0) {           /* write in place + fsync */
+        customer_write_record(fd, idx, &before);             /* fallback: put the old row back */
+        goto done;
+    }
+    status = MOD_OK;
+
+done:
+    if (locked) customer_unlock(fd, idx);
+    close(fd);                                               /* close only after unlocking */
+    return status;
+}
 static TxnStatus apply_transaction(int user_id, double amount,
                                    const char *type, int is_debit,
                                    double *new_balance) {
@@ -875,11 +949,13 @@ static void do_transfer(int fd, const Session *session) {
     }
 }
 
-static void view_history(int fd, const Session *session) {
+/* Sends a customer's last HISTORY_LIMIT committed transactions (newest first) to fd.
+   Used for a customer's own history and by employees looking at a customer. */
+void customer_send_history(int fd, int customer_id) {
     Transaction *list = NULL;
     char msg[BUFFER_SIZE];
 
-    int n = customer_get_history(session->user_id, &list);
+    int n = customer_get_history(customer_id, &list);
     if (n < 0) {
         send_message(fd, "Could not retrieve transaction history. Please try again.\n");
         return;
@@ -893,13 +969,13 @@ static void view_history(int fd, const Session *session) {
     int shown = (n < HISTORY_LIMIT) ? n : HISTORY_LIMIT;
     snprintf(msg, sizeof(msg),
              "\nLast %d of %d transaction(s), newest first:\n"
-             "%-6s %-19s  %-12s %12s %12s\n"
-             "-------------------------------------------------------------------\n",
-             shown, n, "ID", "Date & Time", "Type", "Amount", "Balance");
+             "%-6s %-19s  %-12s %12s %12s  %-6s\n"
+             "-----------------------------------------------------------------------------\n",
+             shown, n, "ID", "Date & Time", "Type", "Amount", "Balance", "With");
     send_message(fd, msg);
 
     for (int i = n - 1; i >= n - shown; i--) {           /* newest first */
-        char when[32], amt[32];
+        char when[32], amt[32], with[16];
         struct tm tmv;
         time_t ts = (time_t)list[i].timestamp;
         localtime_r(&ts, &tmv);
@@ -909,11 +985,18 @@ static void view_history(int fd, const Session *session) {
                      strcmp(list[i].type, TXN_TYPE_TRANSFER_OUT) == 0);
         snprintf(amt, sizeof(amt), "%c%.2f", debit ? '-' : '+', list[i].amount);
 
-        snprintf(msg, sizeof(msg), "%-6d %-19s  %-12s %12s %12.2f\n",
-                 list[i].id, when, list[i].type, amt, list[i].balance_after);
+        if (list[i].peer_id > 0) snprintf(with, sizeof(with), "%d", list[i].peer_id);
+        else                     snprintf(with, sizeof(with), "-");
+
+        snprintf(msg, sizeof(msg), "%-6d %-19s  %-12s %12s %12.2f  %-6s\n",
+                 list[i].id, when, list[i].type, amt, list[i].balance_after, with);
         send_message(fd, msg);
     }
     free(list);
+}
+
+static void view_history(int fd, const Session *session) {
+    customer_send_history(fd, session->user_id);          /* the session decides whose history */
 }
 
 static void do_feedback(int fd, const Session *session) {

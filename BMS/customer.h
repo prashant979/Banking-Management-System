@@ -67,6 +67,17 @@ typedef enum {
 AddStatus customer_add(const char *firstname, const char *lastname, const char *username,
                        const char *password, const char *balance_str, int *new_id);
 
+                       typedef enum {
+    MOD_OK = 0,
+    MOD_NOT_FOUND,
+    MOD_BAD_FIRSTNAME,
+    MOD_BAD_LASTNAME,
+    MOD_NO_CHANGE,
+    MOD_IO_ERROR
+} ModStatus;
 
+ModStatus customer_modify(int id, const char *firstname, const char *lastname);   /* "" = keep current */
+int customer_get_details(int id, Customer *out);   /* 0 ok, -1 not found/error; password blanked */
 
+void customer_send_history(int fd, int customer_id);   /* last 20 committed transactions, newest first */
 #endif
