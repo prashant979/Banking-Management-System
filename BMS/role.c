@@ -8,6 +8,7 @@
 #include "utils.h"
 #include "staff.h"
 #include "role.h"
+#include "loan.h"
 
 /* Row: id(8),username(20),from_role(1),from_id(6),to_role(1),to_id(6),by(6),timestamp(12),status(1)\n */
 #define HIST_ROW_FMT "%-8d,%-20s,%d,%-6d,%d,%-6d,%-6d,%-12ld,%c\n"
@@ -117,6 +118,11 @@ RoleStatus role_change(int from_role, int from_id, int admin_id, int *to_role_ou
     if (src.logged_in) { st = RC_LOGGED_IN; goto done; }
     src_before = src;
 
+    if (from_role == ROLE_EMPLOYEE) {                                 /* source row is held: no assign can slip in */
+        int has = loan_employee_has_assigned(from_id);
+        if (has < 0) goto done;
+        if (has > 0) { st = RC_HAS_LOANS; goto done; }
+    }
     /* 3. target file: an ACTIVE row with this username blocks; an INACTIVE one is reused */
     n = staff_count(dst_fd);
     if (n < 0) goto done;

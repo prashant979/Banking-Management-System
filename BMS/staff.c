@@ -8,6 +8,7 @@
 #include "common.h"
 #include "utils.h"
 #include "staff.h"
+#include "loan.h"
 
 /* Row 0 is the header; staff member i (0-based) is row i+1. Every row is exactly
    STAFF_RECORD_SIZE bytes:  id(6),first(20),last(20),user(20),pass(20),active,logged_in\n */
@@ -399,6 +400,11 @@ StaffModStatus staff_modify(int role, int id, const char *firstname, const char 
     if (active_change == 0 && s.active && s.logged_in) {     /* logged_in can change: re-check */
         st = SM_LOGGED_IN;
         goto done;
+    }
+    if (role == ROLE_EMPLOYEE && active_change == 0 && s.active) {   /* lock order: staff row -> loan rows */
+        int has = loan_employee_has_assigned(id);
+        if (has < 0) goto done;
+        if (has > 0) { st = SM_HAS_LOANS; goto done; }
     }
     before = s;                                              /* before-image for undo */
 

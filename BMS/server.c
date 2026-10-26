@@ -17,6 +17,8 @@
 #include "manager.h"
 #include "admin.h"
 #include "role.h"
+#include "loan.h"
+
 /* Reap finished children so they don't become zombies. */
 static void sigchld_handler(int sig) {
     (void)sig;
@@ -135,6 +137,13 @@ int main(void) {
                         "Move the old files aside and restart.\n", TXN_FILE, FEEDBACK_FILE);
         exit(EXIT_FAILURE);
     }
+
+    if (loan_validate_file() != 0) {
+        fprintf(stderr, "%s is not in the fixed-width format (%d bytes per row).\n",
+                LOAN_FILE, LOAN_RECORD_SIZE);
+        exit(EXIT_FAILURE);
+    }
+
     if (role_validate_history() != 0) {
         fprintf(stderr, "%s is not in the fixed-width format (%d bytes per row).\n",
                 ROLE_HIST_FILE, ROLE_HIST_RECORD_SIZE);

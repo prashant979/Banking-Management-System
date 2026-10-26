@@ -7,6 +7,8 @@
 #include "auth.h"
 #include "customer.h"
 #include "manager.h"
+#include "staff.h"
+#include "loan.h"
 
 #define FEEDBACK_PAGE_SIZE 20
 
@@ -125,6 +127,89 @@ static void view_customer_feedback(int fd, const Session *session) {
     feedback_browser(fd, id);
 }
 
+static void do_assign_loan(int fd, const Session *session) {
+    char buf[BUFFER_SIZE], msg[BUFFER_SIZE];
+    int loan_id, emp_id;
+    Loan l;
+    Customer c;
+    Staff e;
+
+    if (!auth_require_role(session, ROLE_MANAGER)) {        /* role check on the action itself */
+        send_message(fd, "Access denied.\n");
+        return;
+    }
+
+    loan_browser(fd, 0, 0, "PA", "Open Loan Applications");
+
+    if (prompt_input(fd, "\nEnter loan ID to assign (0 to go back): ", buf, sizeof(buf)) <= 0) return;
+    if (strcmp(buf, "0") == 0) return;
+    if (parse_id(buf, &loan_id) != 0 || loan_get(loan_id, &l) != 0) {
+        send_message(fd, "Loan not found.\n");
+        return;
+    }
+    if (l.status == LOAN_STATUS_APPROVED || l.status == LOAN_STATUS_REJECTED) {
+        snprintf(msg, sizeof(msg), "Loan #%d is already %s.\n", l.id, loan_status_name(l.status));
+        send_message(fd, msg);
+        return;
+    }
+
+    if (customer_get_details(l.customer_id, &c) != 0) memset(&c, 0, sizeof(c));
+    snprintf(msg, sizeof(msg),
+             "\nLoan #%d  Customer %d (%.20s %.20s)\n"
+             "Amount %.2f  Term %d months  Purpose: %.30s\n"
+             "Currently: %s",
+             l.id, l.customer_id, c.firstname, c.lastname,
+             l.amount, l.term_months, l.purpose, loan_status_name(l.status));
+    send_message(fd, msg);
+    if (l.status == LOAN_STATUS_ASSIGNED) {
+        snprintf(msg, sizeof(msg), " to employee %d\n", l.employee_id);
+        send_message(fd, msg);
+    } else {
+        send_message(fd, " (not assigned)\n");
+    }
+
+    if (prompt_input(fd, "Assign to employee ID: ", buf, sizeof(buf)) <= 0) return;
+    if (parse_id(buf, &emp_id) != 0 || staff_get_details(ROLE_EMPLOYEE, emp_id, &e) != 0) {
+        send_message(fd, "Employee not found.\n");
+        return;
+    }
+
+    snprintf(msg, sizeof(msg), "%s loan #%d to employee %d (%.20s %.20s)? (y/n): ",
+             l.status == LOAN_STATUS_ASSIGNED ? "Reassign" : "Assign",
+             l.id, e.id, e.firstname, e.lastname);
+    if (prompt_input(fd, msg, buf, sizeof(buf)) <= 0) return;
+    if (strcmp(buf, "y") != 0 && strcmp(buf, "Y") != 0) {
+        send_message(fd, "Cancelled. Nothing was changed.\n");
+        return;
+    }
+
+    /* expected employee = what this manager was just shown (stale check) */
+    switch (loan_assign(l.id, emp_id, session->user_id, l.employee_id)) {
+    case LN_OK:
+        snprintf(msg, sizeof(msg), "Loan #%d is now assigned to employee %d.\n", l.id, emp_id);
+        send_message(fd, msg);
+        break;
+    case LN_STALE:
+        send_message(fd, "This loan was changed by someone else since you viewed it. "
+                         "Please view it again. Nothing was changed.\n");
+        break;
+    case LN_SAME_EMPLOYEE:
+        send_message(fd, "The loan is already assigned to that employee.\n");
+        break;
+    case LN_EMPLOYEE_INVALID:
+        send_message(fd, "That employee is deactivated or no longer exists. Nothing was changed.\n");
+        break;
+    case LN_DECIDED:
+        send_message(fd, "The loan has already been decided. Nothing was changed.\n");
+        break;
+    case LN_NOT_FOUND:
+        send_message(fd, "Loan not found. Nothing was changed.\n");
+        break;
+    default:
+        send_message(fd, "Could not assign the loan due to a server error. Nothing was changed.\n");
+    }
+}
+
 void manager_menu(int fd, Session *session) {
     char buf[BUFFER_SIZE], msg[BUFFER_SIZE];
 
@@ -151,8 +236,11 @@ void manager_menu(int fd, Session *session) {
             return;                                      /* client disconnected */
 
         switch (atoi(buf)) {
-        case 1: case 2:
+        case 1: 
             send_message(fd, "This feature will be implemented in a later step.\n");
+            break;
+        case 2:
+            do_assign_loan(fd, session);
             break;
         case 3:
             view_all_feedback(fd, session);

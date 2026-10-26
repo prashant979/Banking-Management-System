@@ -10,6 +10,7 @@ typedef enum {
     RC_INACTIVE,
     RC_LOGGED_IN,
     RC_USERNAME_TAKEN,
+    RC_HAS_LOANS,
     RC_IO_ERROR
 } RoleStatus;
 
