@@ -114,4 +114,18 @@ typedef enum {
     PW_ERROR
 } PasswordStatus;
 
+#define ROLE_HIST_FILE         "role_history.csv"
+#define ROLE_HIST_RECORD_SIZE  70     /* bytes per history row, including the newline */
+
+/* One role change. Status uses TXN_STATUS_PENDING / COMMITTED / VOID. */
+typedef struct {
+    int  id;                /* = row number in role_history.csv */
+    char username[50];
+    int  from_role, from_id;
+    int  to_role, to_id;
+    int  changed_by;        /* admin id */
+    long timestamp;
+    char status;
+} RoleChange;
+
 #endif

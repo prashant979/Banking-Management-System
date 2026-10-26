@@ -236,3 +236,13 @@ int is_valid_password(const char *s) {
     }
     return 1;
 }
+/* Changes the status byte (second-last byte) of one log row, under that row's lock only. */
+int log_set_status(int fd, long row_no, int row_size, char status) {
+    off_t off = (off_t)row_no * row_size;
+    int rc = -1;
+
+    if (lock_record(fd, F_WRLCK, off, row_size) < 0) return -1;
+    if (pwrite(fd, &status, 1, off + row_size - 2) == 1 && fsync(fd) == 0) rc = 0;
+    unlock_record(fd, off, row_size);
+    return rc;
+}   /* rewrite one row's status byte */
