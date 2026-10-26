@@ -102,7 +102,10 @@ typedef Staff Employee;
 typedef Staff Manager;
 typedef Staff Admin;
 
-#define CUSTOMER_ID_BASE  1000      /* customer id = 1000 + row number in customer.csv */
+#define CUSTOMER_ID_BASE  1000 
+#define EMPLOYEE_ID_BASE  1000      /* staff id = base + row number in its file */
+#define MANAGER_ID_BASE   1000
+#define ADMIN_ID_BASE     1000     /* customer id = 1000 + row number in customer.csv */
 typedef enum {
     PW_OK = 0,
     PW_WRONG_OLD,

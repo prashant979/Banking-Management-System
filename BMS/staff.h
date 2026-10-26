@@ -16,4 +16,20 @@ int staff_find_by_username(int fd, const char *username);      /* index, -1 not 
 int staff_find_by_id(int fd, int id);                          /* same return values */
 
 PasswordStatus staff_change_password(int role, int user_id, const char *old_pw, const char *new_pw);
+
+typedef enum {
+    STAFF_ADD_OK = 0,
+    STAFF_ADD_BAD_FIRSTNAME,
+    STAFF_ADD_BAD_LASTNAME,
+    STAFF_ADD_BAD_USERNAME,
+    STAFF_ADD_BAD_PASSWORD,
+    STAFF_ADD_USERNAME_TAKEN,
+    STAFF_ADD_BAD_ROLE,
+    STAFF_ADD_IO_ERROR
+} StaffAddStatus;
+
+/* Appends a new employee / manager / admin to that role's file. */
+StaffAddStatus staff_add(int role, const char *firstname, const char *lastname,
+                         const char *username, const char *password, int *new_id);
+   
 #endif

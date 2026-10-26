@@ -208,3 +208,31 @@ int parse_id(const char *s, int *out) {
     *out = v;
     return 0;
 }
+
+int is_valid_name(const char *s) {
+    size_t len = strlen(s);
+    if (len < 1 || len > CUSTOMER_FIELD_LEN) return 0;
+    for (size_t i = 0; i < len; i++)
+        if (!isalpha((unsigned char)s[i])) return 0;
+    return 1;
+}
+
+int is_valid_username(const char *s) {
+    size_t len = strlen(s);
+    if (len < 3 || len > CUSTOMER_FIELD_LEN) return 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (!islower(c) && !isdigit(c) && c != '_') return 0;
+    }
+    return 1;
+}
+
+int is_valid_password(const char *s) {
+    size_t len = strlen(s);
+    if (len < MIN_PASSWORD_LEN || len > MAX_PASSWORD_LEN) return 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c <= 32 || c >= 127 || c == ',') return 0;
+    }
+    return 1;
+}
