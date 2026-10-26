@@ -28,3 +28,12 @@ LC_ALL=C awk 'BEGIN{printf "%-8s,%-6s,%-12s,%-200s\n","id","cust","timestamp","m
 NR>1 { split($0,f,","); if (f[1]+0==0) next; msg=$0; sub(/^[^,]*,[^,]*,[^,]*,/,"",msg); n++;
        printf "%-8d,%-6d,%-12d,%-200s\n", n,f[2],f[3],substr(msg,1,200) }' feedback.csv.bak > feedback.csv
 */
+
+/*
+{ printf '%-6s,%-20s,%-20s,%-20s,%-20s,%s,%s\n' id firstname lastname username password a l
+  printf '%-6d,%-20s,%-20s,%-20s,%-20s,%d,%d\n' 3001 Sanjay Rao   sanjay mgr123 1 0
+  printf '%-6d,%-20s,%-20s,%-20s,%-20s,%d,%d\n' 3002 Meena  Joshi meena  mgr456 1 0
+} > manager.csv
+wc -c manager.csv                    # must print 285 (95 x 3 rows)
+awk 'length($0)!=94' manager.csv     # must print nothing
+*/

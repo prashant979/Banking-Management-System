@@ -1,8 +1,8 @@
 CC     = gcc
 CFLAGS = -Wall -Wextra -g
 
-SERVER_SRC = server.c auth.c customer.c staff.c employee.c utils.c
-HEADERS    = common.h utils.h auth.h customer.h staff.h employee.h
+SERVER_SRC = server.c auth.c customer.c staff.c employee.c manager.c utils.c
+HEADERS    = common.h utils.h auth.h customer.h staff.h employee.h manager.h
 
 all: server client main
 
