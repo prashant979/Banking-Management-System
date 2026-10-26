@@ -11,6 +11,7 @@
 #include "utils.h"
 #include "auth.h"
 #include "customer.h"
+#include "loan.h"
 
 
 #define HISTORY_LIMIT 20
@@ -250,11 +251,11 @@ done:
 
 #define TXN_ROW_FMT "%-10d,%-6d,%-6d,%-12s,%14.2f,%14.2f,%-12ld,%c\n"
 
-static int txn_open(void) {
+int txn_open(void) {
     return open(TXN_FILE, O_RDWR);
 }
 
-static int txn_format(const Transaction *t, char *out) {
+int txn_format(const Transaction *t, char *out) {
     if (strlen(t->type) > 12 || strchr(t->type, ',') != NULL) return -1;
     int n = snprintf(out, TXN_RECORD_SIZE + 1, TXN_ROW_FMT,
                      t->id, t->customer_id, t->peer_id, t->type,
@@ -262,7 +263,7 @@ static int txn_format(const Transaction *t, char *out) {
     return (n == TXN_RECORD_SIZE) ? 0 : -1;
 }
 
-static int txn_parse(const char *row, Transaction *t) {
+int txn_parse(const char *row, Transaction *t) {
     char buf[TXN_RECORD_SIZE + 1], status = 0;
     memcpy(buf, row, TXN_RECORD_SIZE);
     buf[TXN_RECORD_SIZE] = '\0';
@@ -283,7 +284,7 @@ static int txn_parse(const char *row, Transaction *t) {
 
 /* Write-ahead: reserve a row, write it as PENDING, fsync. Returns the row number or -1.
    The row lock is held only while the row is written. */
-static long txn_begin(int lfd, int customer_id, int peer_id, const char *type,
+long txn_begin(int lfd, int customer_id, int peer_id, const char *type,
                       double amount, double balance_after) {
     Transaction t;
     char row[TXN_RECORD_SIZE + 1];
@@ -308,7 +309,7 @@ static long txn_begin(int lfd, int customer_id, int peer_id, const char *type,
 }
 
 /* Change one row's status byte (PENDING -> COMMITTED or VOID) under that row's lock only. */
-static int txn_finish(int lfd, long row_no, char status) {
+int txn_finish(int lfd, long row_no, char status) {
     off_t off = (off_t)row_no * TXN_RECORD_SIZE;
     int rc = -1;
 
@@ -1112,6 +1113,101 @@ static void do_change_password(int fd, const Session *session) {
     }
 }
 
+static void do_apply_loan(int fd, const Session *session) {
+    
+    // Idhar gadbad hogaya
+
+    char buf[BUFFER_SIZE], purpose[BUFFER_SIZE], msg[BUFFER_SIZE];
+    double amount;
+    int term, loan_id = 0;
+
+    Loan open_loan;
+    long next;
+    if (loan_page(session->user_id, 0, "PA", 1, &open_loan, 1, &next) > 0) {
+        snprintf(msg, sizeof(msg),
+                 "You already have an open loan (#%d). You can apply again once it is "
+                 "approved or rejected.\n", open_loan.id);
+        send_message(fd, msg);
+        return;
+    }
+
+    if (prompt_input(fd, "Loan amount: ", buf, sizeof(buf)) <= 0) return;
+    if (parse_amount(buf, &amount) != 0) {
+        snprintf(msg, sizeof(msg),
+                 "Invalid amount. Enter a positive number with at most 2 decimals (max %.2f).\n",
+                 MAX_TXN_AMOUNT);
+        send_message(fd, msg);
+        return;
+    }
+
+    snprintf(msg, sizeof(msg), "Term in months (1-%d): ", LOAN_MAX_TERM);
+    if (prompt_input(fd, msg, buf, sizeof(buf)) <= 0) return;
+    if (parse_id(buf, &term) != 0 || term > LOAN_MAX_TERM) {
+        snprintf(msg, sizeof(msg), "Term must be a whole number from 1 to %d.\n", LOAN_MAX_TERM);
+        send_message(fd, msg);
+        return;
+    }
+
+    snprintf(msg, sizeof(msg), "Purpose (1-%d chars: letters, digits, spaces, '-', '.'): ",
+             LOAN_PURPOSE_LEN);
+    if (prompt_input(fd, msg, purpose, sizeof(purpose)) <= 0) return;
+
+    snprintf(msg, sizeof(msg),
+             "\nAmount : %.2f\nTerm   : %d months\nPurpose: %.30s\nSubmit this application? (y/n): ",
+             amount, term, purpose);
+    if (prompt_input(fd, msg, buf, sizeof(buf)) <= 0) return;
+    if (strcmp(buf, "y") != 0 && strcmp(buf, "Y") != 0) {
+        send_message(fd, "Application cancelled.\n");
+        return;
+    }
+
+    switch (loan_apply(session->user_id, amount, term, purpose, &loan_id)) {
+    case LN_OK:
+        snprintf(msg, sizeof(msg),
+                 "Loan application #%d submitted. Status: Pending.\n"
+                 "A manager will assign it to an employee for review.\n", loan_id);
+        send_message(fd, msg);
+        break;
+    case LN_BAD_PURPOSE:
+        snprintf(msg, sizeof(msg),
+                 "Purpose must be 1-%d characters: letters, digits, spaces, '-' or '.'. "
+                 "Application not submitted.\n", LOAN_PURPOSE_LEN);
+        send_message(fd, msg);
+        break;
+    case LN_CUSTOMER_INACTIVE:
+        send_message(fd, "Your account is deactivated. Application not submitted.\n");
+        break;
+    case LN_OPEN_LOAN_EXISTS:
+        snprintf(msg, sizeof(msg),
+                 "You already have an open loan (#%d). You can apply again once it is "
+                 "approved or rejected.\n", loan_id);
+        send_message(fd, msg);
+        break;
+    default:
+        send_message(fd, "Could not submit the application due to a server error. Please try again.\n");
+    }
+}
+
+static void customer_loan_menu(int fd, const Session *session) {
+    char buf[BUFFER_SIZE];
+
+    while (1) {
+        send_message(fd,
+            "\n--- Loans ---\n"
+            "1. Apply for a Loan\n"
+            "2. View My Loans\n"
+            "3. Back\n");
+        if (prompt_input(fd, "Enter choice: ", buf, sizeof(buf)) <= 0) return;
+
+        switch (atoi(buf)) {
+        case 1: do_apply_loan(fd, session);                                 break;
+        case 2: loan_browser(fd, session->user_id, 0, NULL, "My Loans");   break;
+        case 3: return;
+        default: send_message(fd, "Invalid choice.\n");
+        }
+    }
+}
+
 void customer_menu(int fd, Session *session) {
     char buf[BUFFER_SIZE], msg[BUFFER_SIZE];
 
@@ -1154,6 +1250,9 @@ void customer_menu(int fd, Session *session) {
         case 4:
             do_transfer(fd, session);
             break;
+        case 5:
+            customer_loan_menu(fd, session);
+            break;
         case 6:
             view_history(fd, session);
             break;
@@ -1166,9 +1265,6 @@ void customer_menu(int fd, Session *session) {
         case 9:
             send_message(fd, "Logged out.\n");
             return;
-        case 5:
-            send_message(fd, "This feature will be implemented in the next step.\n");
-            break;
         default:
             send_message(fd, "Invalid choice.\n");
         }

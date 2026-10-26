@@ -128,4 +128,30 @@ typedef struct {
     char status;
 } RoleChange;
 
+
+#define LOAN_FILE             "loan.csv"
+#define LOAN_RECORD_SIZE      121
+#define LOAN_PURPOSE_LEN      30
+#define LOAN_MAX_TERM         360          /* months */
+
+#define LOAN_STATUS_PENDING   'P'
+#define LOAN_STATUS_ASSIGNED  'A'
+#define LOAN_STATUS_APPROVED  'Y'
+#define LOAN_STATUS_REJECTED  'N'
+
+#define TXN_TYPE_LOAN_CREDIT  "LOAN_CREDIT"  /* used in Step 3 */
+
+typedef struct {
+    int    id;                          /* = row number in loan.csv */
+    int    customer_id;
+    double amount;
+    int    term_months;
+    char   purpose[LOAN_PURPOSE_LEN + 1];
+    char   status;                      /* P / A / Y / N */
+    int    employee_id;                 /* 0 until assigned */
+    int    assigned_by;                 /* manager id, 0 until assigned */
+    long   applied_at, assigned_at, decided_at;
+} Loan;
+
+
 #endif

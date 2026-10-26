@@ -162,6 +162,10 @@ static void modify_staff_screen(int fd, int role) {
                  role_name(role == ROLE_EMPLOYEE ? ROLE_MANAGER : ROLE_EMPLOYEE), conflict);
         send_message(fd, msg);
         break;
+    case SM_HAS_LOANS:
+        send_message(fd, "This employee still has assigned loans. Ask a manager to reassign them "
+                         "first. Nothing was changed.\n");
+        break;
     default:
         send_message(fd, "Could not update the account due to a server error. Nothing was changed.\n");
     }
@@ -244,6 +248,10 @@ static void do_change_role(int fd, const Session *session) {
     case RC_USERNAME_TAKEN:
         send_message(fd, "An active account with this username already exists in the target role. "
                          "Nothing was changed.\n");
+        break;
+    case RC_HAS_LOANS:
+        send_message(fd, "This employee still has assigned loans. Ask a manager to reassign them "
+                         "first. Nothing was changed.\n");
         break;
     default:
         send_message(fd, "Could not change the role due to a server error. Nothing was changed.\n");

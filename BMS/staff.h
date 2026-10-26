@@ -49,6 +49,7 @@ typedef enum {
     SM_USERNAME_TAKEN,
     SM_LOGGED_IN,
     SM_ACTIVE_IN_OTHER_ROLE,
+    SM_HAS_LOANS,
     SM_NO_CHANGE,
     SM_BAD_ROLE,
     SM_IO_ERROR

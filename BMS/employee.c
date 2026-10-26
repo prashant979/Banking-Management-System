@@ -7,6 +7,7 @@
 #include "auth.h"
 #include "customer.h"
 #include "employee.h"
+#include "loan.h"
 
 static void do_add_customer(int fd, const Session *session) {
     char first[BUFFER_SIZE], last[BUFFER_SIZE], user[BUFFER_SIZE];
@@ -166,6 +167,103 @@ static void do_view_customer_transactions(int fd, const Session *session) {
     send_message(fd, msg);
     customer_send_history(fd, id);
 }
+
+static void do_process_loans(int fd, const Session *session) {
+    char buf[BUFFER_SIZE], msg[BUFFER_SIZE];
+    int loan_id;
+    double new_balance = 0;
+    Loan l;
+    Customer c;
+
+    if (!auth_require_role(session, ROLE_EMPLOYEE)) {      /* role check on the action itself */
+        send_message(fd, "Access denied.\n");
+        return;
+    }
+
+    loan_browser(fd, 0, session->user_id, "A", "My Assigned Loans");
+
+    if (prompt_input(fd, "\nEnter loan ID to process (0 to go back): ", buf, sizeof(buf)) <= 0) return;
+    if (strcmp(buf, "0") == 0) return;
+    if (parse_id(buf, &loan_id) != 0 || loan_get(loan_id, &l) != 0) {
+        send_message(fd, "Loan not found.\n");
+        return;
+    }
+    if (l.status != LOAN_STATUS_ASSIGNED || l.employee_id != session->user_id) {
+        send_message(fd, "That loan is not assigned to you, or it has already been decided.\n");
+        return;
+    }
+
+    if (customer_get_details(l.customer_id, &c) != 0) memset(&c, 0, sizeof(c));
+    snprintf(msg, sizeof(msg),
+             "\nLoan #%d\nCustomer : %d (%.20s %.20s), balance %.2f, %s\n"
+             "Amount   : %.2f\nTerm     : %d months\nPurpose  : %.30s\n",
+             l.id, l.customer_id, c.firstname, c.lastname, c.balance,
+             c.active ? "active" : "DEACTIVATED",
+             l.amount, l.term_months, l.purpose);
+    send_message(fd, msg);
+
+    snprintf(msg, sizeof(msg),
+             "1. Approve (credit %.2f to the customer)\n2. Reject\n3. Cancel\nEnter choice: ", l.amount);
+    if (prompt_input(fd, msg, buf, sizeof(buf)) <= 0) return;
+
+    LoanResult r;
+    int choice = atoi(buf);
+    if (choice == 1)      r = loan_approve(l.id, session->user_id, &new_balance);
+    else if (choice == 2) r = loan_reject(l.id, session->user_id);
+    else { send_message(fd, "Cancelled. Nothing was changed.\n"); return; }
+
+    switch (r) {
+    case LN_OK:
+        if (choice == 1)
+            snprintf(msg, sizeof(msg),
+                     "Loan #%d approved. %.2f credited to account %d (new balance %.2f).\n",
+                     l.id, l.amount, l.customer_id, new_balance);
+        else
+            snprintf(msg, sizeof(msg), "Loan #%d rejected.\n", l.id);
+        send_message(fd, msg);
+        break;
+    case LN_NOT_YOURS:
+        send_message(fd, "This loan is no longer assigned to you (it may have been reassigned). "
+                         "Nothing was changed.\n");
+        break;
+    case LN_DECIDED:
+        send_message(fd, "This loan has already been decided. Nothing was changed.\n");
+        break;
+    case LN_CUSTOMER_INACTIVE:
+        send_message(fd, "The customer's account is deactivated, so the money cannot be credited. "
+                         "Reject the loan instead. Nothing was changed.\n");
+        break;
+    case LN_NOT_FOUND:
+        send_message(fd, "Loan or customer not found. Nothing was changed.\n");
+        break;
+    default:
+        send_message(fd, "Could not process the loan due to a server error. "
+                         "No money was moved and the loan is unchanged.\n");
+    }
+}
+
+/* Loans this employee has decided. Read-only: one shared row lock at a time. */
+static void do_view_decided_loans(int fd, const Session *session) {
+    char buf[BUFFER_SIZE];
+
+    if (!auth_require_role(session, ROLE_EMPLOYEE)) {      /* role check on the action itself */
+        send_message(fd, "Access denied.\n");
+        return;
+    }
+
+    if (prompt_input(fd,
+            "\nShow: 1. All decided   2. Approved only   3. Rejected only\nEnter choice: ",
+            buf, sizeof(buf)) <= 0)
+        return;
+
+    switch (atoi(buf)) {
+    case 1: loan_browser(fd, 0, session->user_id, "YN", "My Decided Loans");  break;
+    case 2: loan_browser(fd, 0, session->user_id, "Y",  "My Approved Loans"); break;
+    case 3: loan_browser(fd, 0, session->user_id, "N",  "My Rejected Loans"); break;
+    default: send_message(fd, "Invalid choice.\n");
+    }
+}
+
 void employee_menu(int fd, Session *session) {
     char buf[BUFFER_SIZE], msg[BUFFER_SIZE];
 
@@ -202,11 +300,14 @@ void employee_menu(int fd, Session *session) {
         case 3:
             do_view_customer_transactions(fd, session);
             break;
-        case 4: case 5:
-            send_message(fd, "This feature will be implemented in a later step.\n");
+        case 4: 
+            do_process_loans(fd, session);
+            break;
+        case 5:
+            do_view_decided_loans(fd, session);    
             break;
         case 6:
-        auth_prompt_change_password(fd, session);
+            auth_prompt_change_password(fd, session);
             break;
         case 7:
             send_message(fd, "Logged out.\n");

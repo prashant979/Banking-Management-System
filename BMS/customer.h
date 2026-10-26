@@ -77,4 +77,11 @@ void customer_send_history(int fd, int customer_id);   /* last 20 committed tran
    Returns the number of rows in out (<= max), -1 on error. *next_row = start row of the next page,
    or 0 if there are no more matching rows. */
 int customer_feedback_page(int customer_id, long start_row, Feedback *out, int max, long *next_row);
+
+/* transaction.csv helpers (used by loan approval) */
+int  txn_open(void);
+long txn_begin(int lfd, int customer_id, int peer_id, const char *type,
+               double amount, double balance_after);      /* writes a durable PENDING row */
+int  txn_finish(int lfd, long row_no, char status);         /* PENDING -> COMMITTED / VOID */
+
 #endif
