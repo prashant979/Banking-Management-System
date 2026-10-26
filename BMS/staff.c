@@ -189,3 +189,76 @@ PasswordStatus staff_change_password(int role, int user_id, const char *old_pw, 
     close(fd);                                            /* close only after unlocking */
     return st;
 }
+
+static int staff_id_base(int role) {
+    switch (role) {
+    case ROLE_EMPLOYEE: return EMPLOYEE_ID_BASE;
+    case ROLE_MANAGER:  return MANAGER_ID_BASE;
+    case ROLE_ADMIN:    return ADMIN_ID_BASE;
+    default:            return -1;
+    }
+}
+
+/* Guard (byte 0) serialises adds to this file; the username check and the append happen
+   under it. Logins and other staff operations lock rows only, so they never wait for it. */
+StaffAddStatus staff_add(int role, const char *firstname, const char *lastname,
+                         const char *username, const char *password, int *new_id) {
+    StaffAddStatus status = STAFF_ADD_IO_ERROR;
+    int guard = 0, row_locked = 0, n, i;
+    off_t off = 0;
+    Staff s, other;
+    char row[STAFF_RECORD_SIZE + 1];
+
+    int base = staff_id_base(role);
+    if (base < 0)                      return STAFF_ADD_BAD_ROLE;
+    if (!is_valid_name(firstname))     return STAFF_ADD_BAD_FIRSTNAME;
+    if (!is_valid_name(lastname))      return STAFF_ADD_BAD_LASTNAME;
+    if (!is_valid_username(username))  return STAFF_ADD_BAD_USERNAME;
+    if (!is_valid_password(password))  return STAFF_ADD_BAD_PASSWORD;
+
+    int fd = staff_open(role);
+    if (fd < 0) return STAFF_ADD_IO_ERROR;
+
+    if (lock_record(fd, F_WRLCK, 0, 1) < 0) goto done;       /* guard: one add at a time */
+    guard = 1;
+
+    n = staff_count(fd);                                     /* stable while we hold the guard */
+    if (n < 0) goto done;
+
+    for (i = 0; i < n; i++) {                                /* username must be unused */
+        int taken = 0;
+        if (staff_lock(fd, i, F_RDLCK) < 0) goto done;
+        if (staff_read_record(fd, i, &other) == 0 && strcmp(other.username, username) == 0)
+            taken = 1;
+        staff_unlock(fd, i);
+        if (taken) { status = STAFF_ADD_USERNAME_TAKEN; goto done; }
+    }
+
+    memset(&s, 0, sizeof(s));
+    s.id        = base + n + 1;                              /* row number n + 1 */
+    s.active    = 1;
+    s.logged_in = 0;
+    strncpy(s.firstname, firstname, sizeof(s.firstname) - 1);
+    strncpy(s.lastname,  lastname,  sizeof(s.lastname)  - 1);
+    strncpy(s.username,  username,  sizeof(s.username)  - 1);
+    strncpy(s.password,  password,  sizeof(s.password)  - 1);
+    if (record_format(&s, row) != 0) goto done;
+
+    off = record_offset(n);                                  /* = current end of file */
+    if (lock_record(fd, F_WRLCK, off, STAFF_RECORD_SIZE) < 0) goto done;
+    row_locked = 1;
+
+    if (pwrite(fd, row, STAFF_RECORD_SIZE, off) != STAFF_RECORD_SIZE || fsync(fd) != 0) {
+        if (ftruncate(fd, off) == 0) fsync(fd);              /* fallback: remove the new row */
+        goto done;
+    }
+
+    *new_id = s.id;
+    status = STAFF_ADD_OK;
+
+done:
+    if (row_locked) unlock_record(fd, off, STAFF_RECORD_SIZE);
+    if (guard)      unlock_record(fd, 0, 1);
+    close(fd);
+    return status;
+}
